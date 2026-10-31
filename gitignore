@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+data.db
+data.db.tmp
+backup.json
+users_export.csv
+.env
