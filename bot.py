@@ -3,6 +3,7 @@
 🐶 ربات تلگرامی داگز رایگان | @FREEDOGSDARKBOT
 سیستم زیرمجموعه‌گیری + جوین اجباری + کپچا ریاضی + برداشت اولتراولت + پنل ادمین کامل
 آماده اجرا روی Render (Webhook) و لوکال (Polling)
+نسخه جوین اجباری: FORCE-JOIN-V3 — نمایش اجباری صفحه عضویت در اولین ورود همه کاربران
 """
 import os
 import re
@@ -24,6 +25,7 @@ TOKEN = os.environ.get("BOT_TOKEN", "9153804092:AAHKqmIb34Qeu0BUFbb8ZPz3w3O-0psV
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8248647747"))
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "FREEDOGSDARKBOT").replace("@", "")
 DB_PATH = os.environ.get("DB_PATH", "data.db")
+BOT_VERSION = "FORCE-JOIN-V3"
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML", threaded=True)
 app = Flask(__name__)
@@ -55,7 +57,15 @@ def init_db():
         total_earned INTEGER DEFAULT 0, total_withdrawn INTEGER DEFAULT 0,
         referrer_id INTEGER, referral_counted INTEGER DEFAULT 0,
         captcha_passed INTEGER DEFAULT 0, is_activated INTEGER DEFAULT 0,
+        join_confirmed INTEGER DEFAULT 0,
         is_banned INTEGER DEFAULT 0, joined_at TEXT)""")
+    # مهاجرت امن دیتابیس‌های قبلی: ستون تأیید صریح جوین اجباری
+    user_columns = {row[1] for row in c.execute("PRAGMA table_info(users)").fetchall()}
+    if "join_confirmed" not in user_columns:
+        c.execute("ALTER TABLE users ADD COLUMN join_confirmed INTEGER DEFAULT 0")
+        # کاربران قبلی هم در اولین استفاده بعد از این نسخه، صفحه جوین را می‌بینند
+        # و باید یک بار دکمه «بررسی عضویت» را بزنند.
+        c.execute("UPDATE users SET join_confirmed=0")
     c.execute("""CREATE TABLE IF NOT EXISTS channels(
         id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, title TEXT, url TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS orders(
@@ -105,8 +115,15 @@ def create_user(uid, username, first_name, referrer_id=None):
     is_admin = 1 if uid == ADMIN_ID else 0
     conn = get_conn()
     conn.execute("""INSERT OR IGNORE INTO users(user_id,username,first_name,referrer_id,
-        captcha_passed,is_activated,joined_at) VALUES(?,?,?,?,?,?,?)""",
-        (uid, username or "", first_name or "", referrer_id, is_admin, is_admin, now_str()))
+        captcha_passed,is_activated,join_confirmed,joined_at) VALUES(?,?,?,?,?,?,?,?)""",
+        (uid, username or "", first_name or "", referrer_id, is_admin, is_admin, is_admin, now_str()))
+    conn.commit()
+    conn.close()
+
+def reset_join_confirmations():
+    """بعد از تغییر فهرست کانال‌های اجباری، همه باید صفحه جوین را دوباره ببینند."""
+    conn = get_conn()
+    conn.execute("UPDATE users SET join_confirmed=0 WHERE user_id != ?", (ADMIN_ID,))
     conn.commit()
     conn.close()
 
@@ -223,39 +240,65 @@ def send_captcha(chat_id, uid):
         f"🧮 <b>{a} + {b} = ؟</b>\n\n👇 جواب درست رو از دکمه‌های زیر انتخاب کن:",
         reply_markup=kb)
 
-def check_membership(uid):
-    """بررسی عضویت در همه کانال‌ها. خروجی: (همه عضو هست؟, لیست کانال‌هایی که عضو نیست)"""
+def _chat_member_is_joined(member):
+    """تشخیص دقیق عضو بودن از روی پاسخ Bot API تلگرام."""
+    status = str(getattr(member, "status", "") or "").lower()
+    if status in ("creator", "administrator", "member"):
+        return True
+    # در گروه‌ها بعضی کاربرانِ خارج‌شده/محدودشده status=restricted دارند،
+    # اما is_member آن‌ها False است؛ این‌ها عضو محسوب نمی‌شوند.
+    if status == "restricted":
+        return bool(getattr(member, "is_member", False))
+    return False
+
+def check_membership(uid, chans=None):
+    """بررسی واقعی عضویت در همه کانال‌ها/گروه‌های اجباری.
+
+    خروجی: (عضو همه هست؟, فهرست کانال‌هایی که عضو نیست یا قابل بررسی نبودند)
+    هر خطای تلگرام هم «عضو نیست» حساب می‌شود تا جوین اجباری دور زده نشود.
+    """
     if get_int_setting("force_join_on", 1) == 0:
         return True, []
-    chans = get_channels()
+    chans = get_channels() if chans is None else chans
     if not chans:
         return True, []
     not_joined = []
     for ch in chans:
         try:
-            m = bot.get_chat_member(ch["chat_id"], uid)
-            if m.status not in ("creator", "administrator", "member", "restricted"):
+            member = bot.get_chat_member(ch["chat_id"], uid)
+            if not _chat_member_is_joined(member):
                 not_joined.append(ch)
-        except Exception:
+        except Exception as e:
+            print(f"[{BOT_VERSION}][FORCE JOIN] check failed: user={uid} chat={ch.get('chat_id')} error={e}")
             not_joined.append(ch)
     return (len(not_joined) == 0), not_joined
 
-def send_join_message(chat_id, uid, not_joined=None):
-    chans = not_joined if not_joined is not None else get_channels()
+def send_join_message(chat_id, uid, not_joined=None, show_all=False):
+    chans = get_channels() if show_all else (not_joined if not_joined is not None else get_channels())
     kb = types.InlineKeyboardMarkup()
     for ch in chans:
         kb.add(types.InlineKeyboardButton(f"📢 عضویت در {ch['title']}", url=ch["url"]))
     kb.add(types.InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_join"))
     u = get_user(uid)
     if u and u["is_activated"]:
-        text = (
-            "🔒 <b>دسترسی شما موقتاً بسته شد!</b>\n\n"
-            "⚠️ دوست عزیز، شما از یک یا چند کانال/گروه جوین اجباری خارج شده‌اید یا هنوز عضو کانال جدید اجباری نشده‌اید.\n\n"
-            "عضویت در همه کانال‌های اجباری برای استفاده از <b>تمام بخش‌های ربات</b> الزامی است و عضویت شما در هر بار استفاده بررسی می‌شود.\n\n"
-            "1️⃣ در کانال‌ها و گروه‌های زیر دوباره عضو شوید\n"
-            "2️⃣ سپس دکمه «✅ بررسی عضویت» را بزنید\n\n"
-            "💰 نگران نباشید؛ موجودی، زیرمجموعه‌ها و سفارش‌های شما حفظ می‌شود و بعد از عضویت مجدد، دسترسی‌تان فوراً باز خواهد شد ✅"
-        )
+        if show_all:
+            text = (
+                "🔒 <b>تأیید عضویت اجباری لازم است!</b>\n\n"
+                "برای ادامه استفاده از ربات، عضویت شما در همه کانال‌ها و گروه‌های زیر باید بررسی و تأیید شود.\n\n"
+                "1️⃣ اگر عضو نیستید، با دکمه‌های زیر عضو شوید\n"
+                "2️⃣ حتماً دکمه «✅ بررسی عضویت» را بزنید\n\n"
+                "⚠️ تا وقتی این تأیید انجام نشود، هیچ بخش ربات برای شما باز نمی‌شود.\n"
+                "💰 موجودی، زیرمجموعه‌ها و سفارش‌های شما کاملاً حفظ می‌شوند ✅"
+            )
+        else:
+            text = (
+                "🔒 <b>دسترسی شما موقتاً بسته شد!</b>\n\n"
+                "⚠️ دوست عزیز، شما از یک یا چند کانال/گروه جوین اجباری خارج شده‌اید یا هنوز عضو کانال جدید اجباری نشده‌اید.\n\n"
+                "عضویت در همه کانال‌های اجباری برای استفاده از <b>تمام بخش‌های ربات</b> الزامی است و عضویت شما در هر بار استفاده بررسی می‌شود.\n\n"
+                "1️⃣ در کانال‌ها و گروه‌های زیر دوباره عضو شوید\n"
+                "2️⃣ سپس دکمه «✅ بررسی عضویت» را بزنید\n\n"
+                "💰 نگران نباشید؛ موجودی، زیرمجموعه‌ها و سفارش‌های شما حفظ می‌شود و بعد از عضویت مجدد، دسترسی‌تان فوراً باز خواهد شد ✅"
+            )
     else:
         text = (
             "🔒 <b>عضویت اجباری برای همه کاربران</b>\n\n"
@@ -276,7 +319,7 @@ def activate_user(uid, chat_id):
     if u["is_activated"]:
         bot.send_message(chat_id, "🏠 <b>منوی اصلی</b>", reply_markup=main_menu(uid))
         return
-    update_user(uid, is_activated=1)
+    update_user(uid, is_activated=1, join_confirmed=1)
     # پاداش زیرمجموعه‌گیری
     if u.get("referrer_id") and not u.get("referral_counted"):
         ref_id = u["referrer_id"]
@@ -304,16 +347,17 @@ def activate_user(uid, chat_id):
         reply_markup=main_menu(uid))
 
 def access_gate(chat_id, uid):
-    """🔒 دروازه دسترسی دائمی ربات
+    """🔒 دروازه دسترسی دائمی ربات — FORCE-JOIN-V3
 
-    این تابع قبل از پردازش هر پیام، کامند و دکمه شیشه‌ای اجرا می‌شود:
-    1) عضویت کاربر در همه کانال‌ها/گروه‌های جوین اجباری — در هر بار استفاده
-    2) کپچای کاربران جدید (فقط تا فعال‌سازی اولیه)
-    3) فعال‌سازی و ثبت زیرمجموعه (فقط یک بار)
+    قبل از هر پیام، کامند، بخش منو و دکمه شیشه‌ای اجرا می‌شود:
+    1) نمایش صفحه جوین اجباری در اولین ورود همه کاربران و دریافت تأیید صریح
+       با دکمه «بررسی عضویت»؛ حتی اگر کاربر از قبل عضو کانال‌ها بوده باشد.
+    2) بررسی واقعی عضویت در هر استفاده؛ ترک هر کانال دسترسی را می‌بندد.
+    3) کپچای کاربران جدید فقط بعد از تأیید جوین اجباری.
+    4) فعال‌سازی و ثبت زیرمجموعه فقط یک بار.
 
-    خروجی True یعنی کاربر اجازه استفاده از بخش درخواستی را دارد.
-    خروجی False یعنی پیام جوین اجباری/کپچا/فعال‌سازی ارسال شده و درخواست فعلی
-    نباید پردازش شود. فقط ادمین برای جلوگیری از قفل‌شدن مدیریت ربات معاف است.
+    True یعنی اجازه ادامه دارد؛ False یعنی صفحه جوین/کپچا/فعال‌سازی ارسال شده
+    و درخواست فعلی نباید پردازش شود. تنها ادمین برای جلوگیری از قفل‌شدن مدیریت معاف است.
     """
     if is_admin(uid):
         return True
@@ -321,25 +365,40 @@ def access_gate(chat_id, uid):
     if not u:
         return False
 
-    # اول: جوین اجباری برای همه؛ هم کاربر عادی، هم زیرمجموعه و هم کاربران قدیمی
-    ok, not_joined = check_membership(uid)
-    if not ok:
-        clear_state(uid)
-        captcha_answers.pop(uid, None)
-        send_join_message(chat_id, uid, not_joined)
-        return False
+    force_join_enabled = get_int_setting("force_join_on", 1) == 1
+    mandatory_channels = get_channels() if force_join_enabled else []
 
-    # کاربران فعال فقط با عضویت کامل اجازه ادامه دارند و دیگر کپچا نمی‌بینند
+    if mandatory_channels:
+        # اول وضعیت واقعی عضویت بررسی می‌شود؛ هیچ کاربری مستقیم به کپچا نمی‌رسد.
+        ok, not_joined = check_membership(uid, mandatory_channels)
+        if not ok:
+            if u.get("join_confirmed"):
+                update_user(uid, join_confirmed=0)
+            clear_state(uid)
+            captcha_answers.pop(uid, None)
+            send_join_message(chat_id, uid, not_joined)
+            return False
+
+        # نکته کلیدی نسخه V3: حتی اگر کاربر از قبل عضو همه کانال‌ها باشد،
+        # تا وقتی join_confirmed او 1 نشده، صفحه همه کانال‌های اجباری با دکمه
+        # بررسی عضویت نمایش داده می‌شود. پس اولین /start هیچ‌وقت مستقیم کپچا نیست.
+        if not u.get("join_confirmed"):
+            clear_state(uid)
+            captcha_answers.pop(uid, None)
+            send_join_message(chat_id, uid, show_all=True)
+            return False
+
+    # کاربران فعال و تأییدشده فقط در صورت عضویت کامل اجازه ادامه دارند.
     if u["is_activated"]:
         return True
 
-    # دوم: کپچا برای فعال‌سازی اولیه
+    # کپچا فقط بعد از عبور کامل از جوین اجباری نمایش داده می‌شود.
     if get_int_setting("captcha_on", 1) == 1 and not u["captcha_passed"]:
         clear_state(uid)
         send_captcha(chat_id, uid)
         return False
 
-    # سوم: فعال‌سازی نهایی و پرداخت یک‌باره پاداش معرف
+    # فعال‌سازی نهایی و پرداخت یک‌باره پاداش معرف
     clear_state(uid)
     activate_user(uid, chat_id)
     return False
@@ -428,6 +487,7 @@ def cmd_id(message):
 def admin_panel_text():
     on = "🟢 روشن" if get_int_setting("bot_on", 1) == 1 else "🔴 خاموش"
     return (f"🛠 <b>پنل مدیریت ربات</b> 🐶\n\n"
+            f"🧩 نسخه در حال اجرا: <code>{BOT_VERSION}</code>\n"
             f"وضعیت ربات: {on}\n"
             f"🎁 پاداش زیرمجموعه: <b>{get_int_setting('referral_reward',100)} داگز</b>\n"
             f"💰 حداقل برداشت: <b>{get_int_setting('min_withdraw',800)} داگز</b>\n\n"
@@ -568,7 +628,7 @@ def restore_from_json(file_bytes):
     conn = get_conn()
     c = conn.cursor()
     cols = {
-        "users": ["user_id","username","first_name","balance","referrals","total_earned","total_withdrawn","referrer_id","referral_counted","captcha_passed","is_activated","is_banned","joined_at"],
+        "users": ["user_id","username","first_name","balance","referrals","total_earned","total_withdrawn","referrer_id","referral_counted","captcha_passed","is_activated","join_confirmed","is_banned","joined_at"],
         "channels": ["id","chat_id","title","url"],
         "orders": ["id","user_id","amount","method","wallet_id","status","created_at","done_at"],
         "settings": ["key","value"],
@@ -785,8 +845,9 @@ def handle_state(message, state):
                      (data["chat_id"], data["title"], url))
         conn.commit()
         conn.close()
+        reset_join_confirmations()
         clear_state(uid)
-        bot.send_message(chat_id, f"✅ کانال <b>{esc(data['title'])}</b> به جوین اجباری اضافه شد 🎉", reply_markup=admin_menu())
+        bot.send_message(chat_id, f"✅ کانال <b>{esc(data['title'])}</b> به جوین اجباری اضافه شد 🎉\n🔒 همه کاربران در استفاده بعدی صفحه جوین اجباری جدید را خواهند دید و باید عضویتشان را دوباره تأیید کنند.", reply_markup=admin_menu())
         return
 
     if step == "search_user":
@@ -1124,8 +1185,11 @@ def handle_admin_button(message, text):
         bot.send_message(chat_id, "🔴 کپچای ریاضی <b>غیرفعال</b> شد." if cur == 1 else "🟢 کپچای ریاضی <b>فعال</b> شد.")
     elif text == "🔒 فعال/غیرفعال جوین اجباری":
         cur = get_int_setting("force_join_on", 1)
-        set_setting("force_join_on", 0 if cur == 1 else 1)
-        bot.send_message(chat_id, "🔴 جوین اجباری <b>غیرفعال</b> شد." if cur == 1 else "🟢 جوین اجباری <b>فعال</b> شد.")
+        new_value = 0 if cur == 1 else 1
+        set_setting("force_join_on", new_value)
+        if new_value == 1:
+            reset_join_confirmations()
+        bot.send_message(chat_id, "🔴 جوین اجباری <b>غیرفعال</b> شد." if cur == 1 else "🟢 جوین اجباری <b>فعال</b> شد؛ همه کاربران در استفاده بعدی باید عضویتشان را تأیید کنند.")
     elif text == "💵 افزایش موجودی کاربر":
         set_state(uid, "add_balance_user")
         bot.send_message(chat_id, "💵 آیدی عددی یا یوزرنیم کاربر را بفرستید:\nبرای لغو: /cancel")
@@ -1244,21 +1308,32 @@ def callbacks(call):
             chosen = int(data.split(":")[1])
         except Exception:
             return
-        # حتی هنگام پاسخ به کپچا هم عضویت دوباره بررسی می‌شود؛ اگر کاربر بین
-        # دریافت کپچا و زدن جواب از کانالی خارج شده باشد، اول باید عضو شود.
+        # کپچا بدون تأیید صریح و فعلی جوین اجباری هرگز قبول نمی‌شود؛ حتی اگر
+        # پیام کپچا قدیمی باشد یا کاربر بعد از دریافت آن از کانالی خارج شده باشد.
         ok_member, not_joined_member = check_membership(uid)
-        if not ok_member:
+        u_cap = get_user(uid)
+        join_not_confirmed = bool(
+            get_int_setting("force_join_on", 1) == 1
+            and get_channels()
+            and not (u_cap or {}).get("join_confirmed")
+        )
+        if not ok_member or join_not_confirmed:
+            if not ok_member:
+                update_user(uid, join_confirmed=0)
             captcha_answers.pop(uid, None)
             clear_state(uid)
             bot.answer_callback_query(
                 call.id,
-                "🔒 عضویت شما کامل نیست؛ ابتدا در همه کانال‌های اجباری عضو شوید.",
+                "🔒 ابتدا باید عضویت در همه کانال‌های اجباری تأیید شود؛ بعد کپچا نمایش داده می‌شود.",
                 show_alert=True)
             try:
                 bot.delete_message(chat_id, call.message.message_id)
             except Exception:
                 pass
-            send_join_message(chat_id, uid, not_joined_member)
+            if not ok_member:
+                send_join_message(chat_id, uid, not_joined_member)
+            else:
+                send_join_message(chat_id, uid, show_all=True)
             return
         if captcha_answers.get(uid) == chosen:
             captcha_answers.pop(uid, None)
@@ -1270,6 +1345,7 @@ def callbacks(call):
                 pass
             ok, not_joined = check_membership(uid)
             if not ok:
+                update_user(uid, join_confirmed=0, captcha_passed=0)
                 send_join_message(chat_id, uid, not_joined)
             else:
                 activate_user(uid, chat_id)
@@ -1286,6 +1362,8 @@ def callbacks(call):
     if data == "check_join":
         ok, not_joined = check_membership(uid)
         if ok:
+            # این تأیید صریح همان چیزی است که اجازه عبور از صفحه اول جوین را می‌دهد.
+            update_user(uid, join_confirmed=1)
             bot.answer_callback_query(call.id, "✅ عضویت شما تأیید شد!", show_alert=False)
             try:
                 bot.edit_message_text("✅ <b>عضویت شما در همه کانال‌ها تأیید شد 🎉</b>", chat_id, call.message.message_id)
@@ -1305,8 +1383,11 @@ def callbacks(call):
             else:
                 activate_user(uid, chat_id)
         else:
+            update_user(uid, join_confirmed=0)
             names = "، ".join(ch["title"] for ch in not_joined)
             bot.answer_callback_query(call.id, f"❌ هنوز عضو این‌ها نشدی: {names}", show_alert=True)
+            # صفحه تازه فقط با کانال‌های باقی‌مانده ارسال می‌شود تا دکمه‌ها حتماً دیده شوند.
+            send_join_message(chat_id, uid, not_joined)
         return
 
     # --- روش برداشت: اولتراولت ---
@@ -1401,6 +1482,7 @@ def callbacks(call):
         conn.execute("DELETE FROM channels WHERE id=?", (cid,))
         conn.commit()
         conn.close()
+        reset_join_confirmations()
         bot.answer_callback_query(call.id, "🗑 کانال حذف شد")
         try:
             bot.edit_message_text("✅ کانال از لیست جوین اجباری حذف شد.", chat_id, call.message.message_id)
@@ -1476,10 +1558,10 @@ if __name__ == "__main__":
         bot.remove_webhook()
         time.sleep(1)
         bot.set_webhook(url=webhook_url.rstrip("/") + "/" + TOKEN)
-        print("✅ Webhook set:", webhook_url)
+        print(f"✅ Bot version {BOT_VERSION} | Webhook set:", webhook_url)
         app.run(host="0.0.0.0", port=port)
     else:
         bot.remove_webhook()
-        print("✅ Bot started with Polling (local mode)")
+        print(f"✅ Bot version {BOT_VERSION} started with Polling (local mode)")
         threading.Thread(target=lambda: bot.infinity_polling(skip_pending=True), daemon=True).start()
         app.run(host="0.0.0.0", port=port)
