@@ -2,6 +2,11 @@ __pycache__/
 *.pyc
 data.db
 data.db.tmp
+data.db-wal
+data.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 backup.json
 users_export.csv
 .env
