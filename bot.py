@@ -195,7 +195,7 @@ GUIDE = """📖 <b>راهنما و قوانین ربات</b>
 
 ⚠️ <b>قوانین:</b>
 1️⃣ استفاده از اکانت فیک و چند اکانت برای زیرمجموعه‌گیری ممنوعه و باعث مسدودی و حذف موجودی میشه.
-2️⃣ تا زمان تسویه سفارش، در کانال‌های اجباری عضو بمون.
+2️⃣ عضویت در کانال‌های اجباری برای همه کاربران و در تمام زمان استفاده از ربات الزامیه؛ اگر از هر کانالی خارج بشی، دسترسی‌ات به همه بخش‌های ربات بسته میشه تا وقتی دوباره عضو بشی.
 3️⃣ آیدی عددی اولتراولت رو با دقت وارد کن؛ مسئولیت اشتباه وارد کردن با خودته.
 4️⃣ سفارش‌ها به ترتیب ثبت بررسی و پرداخت میشن، پس لطفاً صبور باش. 🙏
 
@@ -246,13 +246,27 @@ def send_join_message(chat_id, uid, not_joined=None):
     for ch in chans:
         kb.add(types.InlineKeyboardButton(f"📢 عضویت در {ch['title']}", url=ch["url"]))
     kb.add(types.InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_join"))
-    bot.send_message(chat_id,
-        "🔒 <b>عضویت اجباری</b>\n\n"
-        "دوست عزیز، برای استفاده از ربات و دریافت داگز رایگان 🐶 باید اول در کانال‌ها و گروه‌های زیر عضو بشی.\n\n"
-        "1️⃣ روی هر دکمه بزن و عضو شو\n"
-        "2️⃣ بعد دکمه «✅ بررسی عضویت» رو بزن\n\n"
-        "⚠️ توجه: تا وقتی عضو همه نشی، حسابت فعال نمیشه و زیرمجموعه هم حساب نمیشی!",
-        reply_markup=kb)
+    u = get_user(uid)
+    if u and u["is_activated"]:
+        text = (
+            "🔒 <b>دسترسی شما موقتاً بسته شد!</b>\n\n"
+            "⚠️ دوست عزیز، شما از یک یا چند کانال/گروه جوین اجباری خارج شده‌اید یا هنوز عضو کانال جدید اجباری نشده‌اید.\n\n"
+            "عضویت در همه کانال‌های اجباری برای استفاده از <b>تمام بخش‌های ربات</b> الزامی است و عضویت شما در هر بار استفاده بررسی می‌شود.\n\n"
+            "1️⃣ در کانال‌ها و گروه‌های زیر دوباره عضو شوید\n"
+            "2️⃣ سپس دکمه «✅ بررسی عضویت» را بزنید\n\n"
+            "💰 نگران نباشید؛ موجودی، زیرمجموعه‌ها و سفارش‌های شما حفظ می‌شود و بعد از عضویت مجدد، دسترسی‌تان فوراً باز خواهد شد ✅"
+        )
+    else:
+        text = (
+            "🔒 <b>عضویت اجباری برای همه کاربران</b>\n\n"
+            "دوست عزیز، برای ورود و استفاده از تمام بخش‌های ربات و دریافت داگز رایگان 🐶 باید اول در همه کانال‌ها و گروه‌های زیر عضو بشی؛ فرقی نمی‌کنه با لینک دعوت اومده باشی یا مستقیم ربات رو استارت کرده باشی.\n\n"
+            "1️⃣ روی هر دکمه بزن و عضو شو\n"
+            "2️⃣ بعد دکمه «✅ بررسی عضویت» رو بزن\n"
+            "3️⃣ در مرحله بعد کپچای امنیتی ریاضی رو حل کن\n\n"
+            "⚠️ تا وقتی عضو همه کانال‌ها نشی و کپچا رو درست حل نکنی، حسابت فعال نمیشه، زیرمجموعه حساب نمیشی و نمی‌تونی از هیچ بخش ربات استفاده کنی.\n"
+            "همچنین اگر بعداً از هر کانالی خارج بشی، دسترسی‌ات دوباره بسته میشه تا وقتی مجدد عضو بشی."
+        )
+    bot.send_message(chat_id, text, reply_markup=kb)
 
 def activate_user(uid, chat_id):
     """فعال‌سازی نهایی کاربر + پرداخت پاداش به معرف (فقط یک بار)"""
@@ -289,19 +303,50 @@ def activate_user(uid, chat_id):
         WELCOME.format(reward=reward, minwd=minwd),
         reply_markup=main_menu(uid))
 
-def gate(chat_id, uid):
-    """دروازه ورود: اول کپچا، بعد جوین اجباری، بعد فعال‌سازی"""
+def access_gate(chat_id, uid):
+    """🔒 دروازه دسترسی دائمی ربات
+
+    این تابع قبل از پردازش هر پیام، کامند و دکمه شیشه‌ای اجرا می‌شود:
+    1) عضویت کاربر در همه کانال‌ها/گروه‌های جوین اجباری — در هر بار استفاده
+    2) کپچای کاربران جدید (فقط تا فعال‌سازی اولیه)
+    3) فعال‌سازی و ثبت زیرمجموعه (فقط یک بار)
+
+    خروجی True یعنی کاربر اجازه استفاده از بخش درخواستی را دارد.
+    خروجی False یعنی پیام جوین اجباری/کپچا/فعال‌سازی ارسال شده و درخواست فعلی
+    نباید پردازش شود. فقط ادمین برای جلوگیری از قفل‌شدن مدیریت ربات معاف است.
+    """
+    if is_admin(uid):
+        return True
     u = get_user(uid)
     if not u:
-        return
-    if get_int_setting("captcha_on", 1) == 1 and not u["captcha_passed"]:
-        send_captcha(chat_id, uid)
-        return
+        return False
+
+    # اول: جوین اجباری برای همه؛ هم کاربر عادی، هم زیرمجموعه و هم کاربران قدیمی
     ok, not_joined = check_membership(uid)
     if not ok:
+        clear_state(uid)
+        captcha_answers.pop(uid, None)
         send_join_message(chat_id, uid, not_joined)
-        return
+        return False
+
+    # کاربران فعال فقط با عضویت کامل اجازه ادامه دارند و دیگر کپچا نمی‌بینند
+    if u["is_activated"]:
+        return True
+
+    # دوم: کپچا برای فعال‌سازی اولیه
+    if get_int_setting("captcha_on", 1) == 1 and not u["captcha_passed"]:
+        clear_state(uid)
+        send_captcha(chat_id, uid)
+        return False
+
+    # سوم: فعال‌سازی نهایی و پرداخت یک‌باره پاداش معرف
+    clear_state(uid)
     activate_user(uid, chat_id)
+    return False
+
+def gate(chat_id, uid):
+    """نام قدیمی دروازه ورود؛ برای سازگاری نگه داشته شده است."""
+    return access_gate(chat_id, uid)
 
 # ============================ کامندها ============================
 @bot.message_handler(commands=["start"])
@@ -339,8 +384,8 @@ def cmd_start(message):
     if get_int_setting("bot_on", 1) == 0 and not is_admin(uid):
         bot.send_message(message.chat.id, BOT_OFF_TEXT)
         return
-    if not u["is_activated"] and not is_admin(uid):
-        gate(message.chat.id, uid)
+    # در هر /start عضویت همه کاربران (عادی، قدیمی و زیرمجموعه) دوباره بررسی می‌شود
+    if not is_admin(uid) and not access_gate(message.chat.id, uid):
         return
     reward = get_int_setting("referral_reward", 100)
     minwd = get_int_setting("min_withdraw", 800)
@@ -355,12 +400,30 @@ def cmd_admin(message):
 @bot.message_handler(commands=["cancel"])
 def cmd_cancel(message):
     uid = message.from_user.id
+    if not get_user(uid):
+        create_user(uid, message.from_user.username, message.from_user.first_name)
     clear_state(uid)
-    bot.send_message(message.chat.id, "❌ عملیات لغو شد.", reply_markup=main_menu(uid))
+    bot.send_message(message.chat.id, "❌ عملیات لغو شد.")
+    # حتی بعد از لغو هم کاربر غیرعضو به منوی اصلی و بخش‌ها دسترسی ندارد
+    if is_admin(uid) or access_gate(message.chat.id, uid):
+        bot.send_message(message.chat.id, "🏠 <b>منوی اصلی</b>", reply_markup=main_menu(uid))
 
 @bot.message_handler(commands=["id"])
 def cmd_id(message):
-    bot.reply_to(message, f"🆔 آیدی عددی شما: <code>{message.from_user.id}</code>")
+    uid = message.from_user.id
+    if not get_user(uid):
+        create_user(uid, message.from_user.username, message.from_user.first_name)
+    u = get_user(uid)
+    if not is_admin(uid):
+        if u and u["is_banned"]:
+            bot.send_message(message.chat.id, BANNED_TEXT)
+            return
+        if get_int_setting("bot_on", 1) == 0:
+            bot.send_message(message.chat.id, BOT_OFF_TEXT)
+            return
+        if not access_gate(message.chat.id, uid):
+            return
+    bot.reply_to(message, f"🆔 آیدی عددی شما: <code>{uid}</code>")
 
 def admin_panel_text():
     on = "🟢 روشن" if get_int_setting("bot_on", 1) == 1 else "🔴 خاموش"
@@ -890,14 +953,15 @@ def main_handler(message):
         bot.send_message(chat_id, BOT_OFF_TEXT)
         return
 
-    # State در جریان
-    if uid in user_states:
-        handle_state(message, user_states[uid])
+    # 🔒 بررسی دائمی و همگانی جوین اجباری قبل از هر بخش و حتی قبل از ادامه
+    # عملیات‌های نیمه‌تمام (مثل واردکردن مبلغ یا آیدی برداشت و پشتیبانی).
+    # اگر کاربر از هر کانال خارج شده باشد، همین‌جا متوقف و صفحه عضویت نمایش داده می‌شود.
+    if not is_admin(uid) and not access_gate(chat_id, uid):
         return
 
-    # کاربران غیرفعال اول باید کپچا + جوین را رد کنند
-    if not u["is_activated"] and not is_admin(uid):
-        gate(chat_id, uid)
+    # State در جریان — فقط بعد از تأیید عضویت کامل پردازش می‌شود
+    if uid in user_states:
+        handle_state(message, user_states[uid])
         return
 
     if not text:
@@ -1150,11 +1214,51 @@ def callbacks(call):
     chat_id = call.message.chat.id
     data = call.data or ""
 
+    if not get_user(uid):
+        create_user(uid, call.from_user.username, call.from_user.first_name)
+    u_cb = get_user(uid)
+
+    # هیچ دکمه شیشه‌ای برای کاربر مسدود یا هنگام خاموشی ربات پردازش نمی‌شود
+    if not is_admin(uid):
+        if u_cb and u_cb["is_banned"]:
+            bot.answer_callback_query(call.id, "🚫 حساب شما مسدود است.", show_alert=True)
+            return
+        if get_int_setting("bot_on", 1) == 0:
+            bot.answer_callback_query(call.id, "🔌 ربات فعلاً از طرف مدیریت خاموش شده است.", show_alert=True)
+            return
+
+    # 🔒 همه دکمه‌های شیشه‌ای (به‌جز خود دکمه بررسی عضویت و کپچا که جداگانه
+    # کنترل می‌شوند) ابتدا از دروازه جوین اجباری رد می‌شوند. بنابراین کاربری که
+    # کانالی را ترک کرده نمی‌تواند با دکمه‌های قدیمی، مثلاً ادامه برداشت، جلو برود.
+    if not is_admin(uid) and data != "check_join" and not data.startswith("cap:"):
+        if not access_gate(chat_id, uid):
+            bot.answer_callback_query(
+                call.id,
+                "🔒 ابتدا باید عضو همه کانال‌های اجباری شوید تا بتوانید از ربات استفاده کنید.",
+                show_alert=True)
+            return
+
     # --- کپچا ---
     if data.startswith("cap:"):
         try:
             chosen = int(data.split(":")[1])
         except Exception:
+            return
+        # حتی هنگام پاسخ به کپچا هم عضویت دوباره بررسی می‌شود؛ اگر کاربر بین
+        # دریافت کپچا و زدن جواب از کانالی خارج شده باشد، اول باید عضو شود.
+        ok_member, not_joined_member = check_membership(uid)
+        if not ok_member:
+            captcha_answers.pop(uid, None)
+            clear_state(uid)
+            bot.answer_callback_query(
+                call.id,
+                "🔒 عضویت شما کامل نیست؛ ابتدا در همه کانال‌های اجباری عضو شوید.",
+                show_alert=True)
+            try:
+                bot.delete_message(chat_id, call.message.message_id)
+            except Exception:
+                pass
+            send_join_message(chat_id, uid, not_joined_member)
             return
         if captcha_answers.get(uid) == chosen:
             captcha_answers.pop(uid, None)
@@ -1188,7 +1292,15 @@ def callbacks(call):
             except Exception:
                 pass
             u = get_user(uid)
-            if get_int_setting("captcha_on", 1) == 1 and u and not u["captcha_passed"]:
+            if u and u["is_activated"]:
+                # کاربر قدیمی بعد از عضویت مجدد بدون فعال‌سازی یا پاداش تکراری
+                # مستقیم به منوی اصلی برمی‌گردد و موجودی/اطلاعاتش دست‌نخورده می‌ماند.
+                bot.send_message(chat_id,
+                    "✅ <b>عضویت مجدد شما تأیید شد و دسترسی‌تان دوباره باز شد!</b> 🎉\n\n"
+                    "💰 موجودی، زیرمجموعه‌ها و سفارش‌های شما مثل قبل حفظ شده‌اند.\n"
+                    "⚠️ لطفاً توجه داشته باشید اگر دوباره از هر کانال اجباری خارج شوید، دسترسی به ربات تا عضویت مجدد بسته می‌شود.",
+                    reply_markup=main_menu(uid))
+            elif get_int_setting("captcha_on", 1) == 1 and u and not u["captcha_passed"]:
                 send_captcha(chat_id, uid)
             else:
                 activate_user(uid, chat_id)
