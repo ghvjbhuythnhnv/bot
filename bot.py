@@ -3,7 +3,7 @@
 🐶 ربات تلگرامی داگز رایگان | @FREEDOGSDARKBOT
 سیستم زیرمجموعه‌گیری + جوین اجباری + کپچا ریاضی + برداشت اولتراولت + پنل ادمین کامل
 آماده اجرا روی Render (Webhook) و لوکال (Polling)
-نسخه جوین اجباری: FORCE-JOIN-V3 — نمایش اجباری صفحه عضویت در اولین ورود همه کاربران
+نسخه تمیز و نهایی: V4-CLEAN-FORCE-JOIN — شروع تازه کاربران، جوین اجباری همگانی و مقاوم در برابر خطا
 """
 import os
 import re
@@ -14,10 +14,12 @@ import time
 import random
 import sqlite3
 import threading
+import traceback
 from datetime import datetime
+from urllib.parse import urlparse
 
 import telebot
-from telebot import types
+from telebot import apihelper, types
 from flask import Flask, request
 
 # ============================ تنظیمات اصلی ============================
@@ -25,13 +27,22 @@ TOKEN = os.environ.get("BOT_TOKEN", "9153804092:AAHKqmIb34Qeu0BUFbb8ZPz3w3O-0psV
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8248647747"))
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "FREEDOGSDARKBOT").replace("@", "")
 DB_PATH = os.environ.get("DB_PATH", "data.db")
-BOT_VERSION = "FORCE-JOIN-V3"
+BOT_VERSION = "V4-CLEAN-FORCE-JOIN"
+CLEAN_RESET_MARKER = "clean_reset_v4_done"
 
-bot = telebot.TeleBot(TOKEN, parse_mode="HTML", threaded=True)
+# جلوگیری از گیرکردن طولانی درخواست‌های تلگرام؛ ربات باید همیشه پاسخ بدهد.
+apihelper.CONNECT_TIMEOUT = 10
+apihelper.READ_TIMEOUT = 25
+
+bot = telebot.TeleBot(TOKEN, parse_mode="HTML", threaded=True, num_threads=4)
 app = Flask(__name__)
 
 user_states = {}      # state های موقت کاربران {user_id: {"step":..., "data":{}}}
 captcha_answers = {}  # جواب کپچای هر کاربر
+_last_setup_notice_at = 0.0
+
+def log(*args):
+    print(f"[{BOT_VERSION}]", *args, flush=True)
 
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -44,13 +55,33 @@ def esc(x):
 
 # ============================ دیتابیس ============================
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
     return conn
 
-def init_db():
+def _init_db_impl():
     conn = get_conn()
     c = conn.cursor()
+    # جدول متادیتا مشخص می‌کند پاک‌سازی یک‌باره نسخه V4 انجام شده یا نه.
+    c.execute("CREATE TABLE IF NOT EXISTS app_meta(key TEXT PRIMARY KEY, value TEXT)")
+    marker = c.execute("SELECT value FROM app_meta WHERE key=?", (CLEAN_RESET_MARKER,)).fetchone()
+    clean_reset_needed = not marker or marker[0] != "1"
+
+    if clean_reset_needed:
+        # طبق درخواست مدیریت: اطلاعات کاربران و سفارش‌های نسخه‌های قبلی حفظ نمی‌شود.
+        # کانال‌ها و تنظیمات حذف نمی‌شوند؛ فقط جدول کاربران/سفارش‌ها از نو ساخته می‌شود.
+        c.execute("DROP TABLE IF EXISTS users")
+        c.execute("DROP TABLE IF EXISTS orders")
+        log("One-time V4 clean reset: old users/orders removed; channels/settings kept when present.")
+
     c.execute("""CREATE TABLE IF NOT EXISTS users(
         user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
         balance INTEGER DEFAULT 0, referrals INTEGER DEFAULT 0,
@@ -59,13 +90,20 @@ def init_db():
         captcha_passed INTEGER DEFAULT 0, is_activated INTEGER DEFAULT 0,
         join_confirmed INTEGER DEFAULT 0,
         is_banned INTEGER DEFAULT 0, joined_at TEXT)""")
-    # مهاجرت امن دیتابیس‌های قبلی: ستون تأیید صریح جوین اجباری
+
+    # اگر به هر دلیل جدولی قدیمی باقی مانده باشد، همه ستون‌های لازم تکمیل می‌شوند.
+    desired_user_columns = {
+        "username": "TEXT", "first_name": "TEXT", "balance": "INTEGER DEFAULT 0",
+        "referrals": "INTEGER DEFAULT 0", "total_earned": "INTEGER DEFAULT 0",
+        "total_withdrawn": "INTEGER DEFAULT 0", "referrer_id": "INTEGER",
+        "referral_counted": "INTEGER DEFAULT 0", "captcha_passed": "INTEGER DEFAULT 0",
+        "is_activated": "INTEGER DEFAULT 0", "join_confirmed": "INTEGER DEFAULT 0",
+        "is_banned": "INTEGER DEFAULT 0", "joined_at": "TEXT",
+    }
     user_columns = {row[1] for row in c.execute("PRAGMA table_info(users)").fetchall()}
-    if "join_confirmed" not in user_columns:
-        c.execute("ALTER TABLE users ADD COLUMN join_confirmed INTEGER DEFAULT 0")
-        # کاربران قبلی هم در اولین استفاده بعد از این نسخه، صفحه جوین را می‌بینند
-        # و باید یک بار دکمه «بررسی عضویت» را بزنند.
-        c.execute("UPDATE users SET join_confirmed=0")
+    for col, ddl in desired_user_columns.items():
+        if col not in user_columns:
+            c.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
     c.execute("""CREATE TABLE IF NOT EXISTS channels(
         id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, title TEXT, url TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS orders(
@@ -84,8 +122,35 @@ def init_db():
     }
     for k, v in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
+    c.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_status ON orders(user_id,status)")
+    if clean_reset_needed:
+        # شروع تمیز V4 نباید به خاطر خاموش‌بودن اتفاقی گزینه‌های نسخه قبلی بی‌پاسخ بماند.
+        for key in ("bot_on", "withdraw_on", "captcha_on", "force_join_on"):
+            c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?, '1')", (key,))
+        c.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES(?, '1')", (CLEAN_RESET_MARKER,))
+    c.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES('bot_version', ?)", (BOT_VERSION,))
     conn.commit()
     conn.close()
+
+def init_db():
+    """راه‌اندازی دیتابیس؛ فایل خراب قدیمی را کنار می‌گذارد و تمیز شروع می‌کند."""
+    try:
+        _init_db_impl()
+    except sqlite3.DatabaseError:
+        log("database is corrupt; quarantining it and creating a clean one", traceback.format_exc())
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        for suffix in ("", "-wal", "-shm"):
+            path = DB_PATH + suffix
+            if os.path.exists(path):
+                try:
+                    os.replace(path, f"{path}.corrupt-{stamp}")
+                except Exception:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+        _init_db_impl()
 
 def get_setting(key, default=""):
     conn = get_conn()
@@ -109,16 +174,42 @@ def get_user(uid):
     conn = get_conn()
     r = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
     conn.close()
-    return dict(r) if r else None
+    if not r:
+        return None
+    u = dict(r)
+    # مقادیر پیش‌فرض امن برای رکوردهای ناقص؛ هیچ هندلری نباید KeyError بگیرد.
+    for key, default in {
+        "username": "", "first_name": "", "balance": 0, "referrals": 0,
+        "total_earned": 0, "total_withdrawn": 0, "referrer_id": None,
+        "referral_counted": 0, "captcha_passed": 0, "is_activated": 0,
+        "join_confirmed": 0, "is_banned": 0, "joined_at": "",
+    }.items():
+        if u.get(key) is None:
+            u[key] = default
+    return u
 
 def create_user(uid, username, first_name, referrer_id=None):
-    is_admin = 1 if uid == ADMIN_ID else 0
+    is_admin_flag = 1 if uid == ADMIN_ID else 0
     conn = get_conn()
     conn.execute("""INSERT OR IGNORE INTO users(user_id,username,first_name,referrer_id,
         captcha_passed,is_activated,join_confirmed,joined_at) VALUES(?,?,?,?,?,?,?,?)""",
-        (uid, username or "", first_name or "", referrer_id, is_admin, is_admin, is_admin, now_str()))
+        (uid, username or "", first_name or "", referrer_id, is_admin_flag, is_admin_flag, is_admin_flag, now_str()))
     conn.commit()
     conn.close()
+    return get_user(uid)
+
+def ensure_user_record(from_user, referrer_id=None, update_profile=False):
+    """کاربر تلگرام را با اطمینان در دیتابیس می‌سازد/برمی‌گرداند."""
+    uid = from_user.id
+    u = get_user(uid)
+    if not u:
+        return create_user(uid, getattr(from_user, "username", ""), getattr(from_user, "first_name", ""), referrer_id)
+    if update_profile:
+        update_user(uid,
+                    username=getattr(from_user, "username", "") or "",
+                    first_name=getattr(from_user, "first_name", "") or "")
+        return get_user(uid)
+    return u
 
 def reset_join_confirmations():
     """بعد از تغییر فهرست کانال‌های اجباری، همه باید صفحه جوین را دوباره ببینند."""
@@ -131,22 +222,49 @@ def update_user(uid, **kw):
     if not kw:
         return
     cols = ", ".join(f"{k}=?" for k in kw)
-    conn = get_conn()
-    conn.execute(f"UPDATE users SET {cols} WHERE user_id=?", (*kw.values(), uid))
-    conn.commit()
-    conn.close()
+    for attempt in range(2):
+        conn = get_conn()
+        try:
+            conn.execute(f"UPDATE users SET {cols} WHERE user_id=?", (*kw.values(), uid))
+            conn.commit()
+            return
+        except sqlite3.OperationalError:
+            conn.rollback()
+            if attempt == 1:
+                raise
+            # اگر اسکیما به هر دلیل ناقص بود، یک بار ترمیم و دوباره تلاش می‌شود.
+            init_db()
+        finally:
+            conn.close()
 
 def inc_user(uid, field, amount):
-    conn = get_conn()
-    conn.execute(f"UPDATE users SET {field}={field}+? WHERE user_id=?", (amount, uid))
-    conn.commit()
-    conn.close()
+    for attempt in range(2):
+        conn = get_conn()
+        try:
+            conn.execute(f"UPDATE users SET {field}={field}+? WHERE user_id=?", (amount, uid))
+            conn.commit()
+            return
+        except sqlite3.OperationalError:
+            conn.rollback()
+            if attempt == 1:
+                raise
+            init_db()
+        finally:
+            conn.close()
 
 def get_channels():
     conn = get_conn()
     rows = conn.execute("SELECT * FROM channels ORDER BY id").fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    channels = []
+    for r in rows:
+        ch = dict(r)
+        # نرمال‌سازی در زمان خواندن باعث می‌شود رکوردهای قدیمی/ناقص هم ربات را متوقف نکنند.
+        ch["chat_id"] = normalize_force_join_chat_id(ch.get("chat_id"))
+        ch["title"] = str(ch.get("title") or ch["chat_id"] or "کانال اجباری")
+        ch["url"] = normalize_force_join_url(ch.get("url"), ch["chat_id"])
+        channels.append(ch)
+    return channels
 
 def all_user_ids():
     conn = get_conn()
@@ -240,6 +358,52 @@ def send_captcha(chat_id, uid):
         f"🧮 <b>{a} + {b} = ؟</b>\n\n👇 جواب درست رو از دکمه‌های زیر انتخاب کن:",
         reply_markup=kb)
 
+def normalize_force_join_chat_id(raw):
+    """تبدیل ورودی‌های مختلف کانال/گروه به chat_id قابل استفاده در Bot API."""
+    raw = str(raw or "").strip()
+    if not raw:
+        return ""
+    m = re.match(r"https?://(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,})(?:/.*)?$", raw)
+    if m:
+        return "@" + m.group(1)
+    m = re.match(r"(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,})(?:/.*)?$", raw)
+    if m:
+        return "@" + m.group(1)
+    if re.fullmatch(r"@[A-Za-z0-9_]{4,}", raw):
+        return raw
+    if re.fullmatch(r"[A-Za-z0-9_]{4,}", raw):
+        return "@" + raw
+    # بعضی پنل‌ها آیدی سوپرگروه را به شکل 100123... نشان می‌دهند؛ Bot API منفی می‌خواهد.
+    if re.fullmatch(r"100\d{7,}", raw):
+        return "-" + raw
+    return raw
+
+def normalize_force_join_url(raw, chat_id=None):
+    """ساخت URL معتبر برای دکمه عضویت؛ خروجی خالی یعنی URL قابل استفاده نیست."""
+    raw = str(raw or "").strip()
+    chat_id = normalize_force_join_chat_id(chat_id)
+
+    if raw in ("خودکار", "auto", "AUTO", ""):
+        if chat_id.startswith("@"):
+            return "https://t.me/" + chat_id[1:]
+        return ""
+    if raw.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{4,}", raw):
+        return "https://t.me/" + raw[1:]
+    if re.match(r"(?:t\.me|telegram\.me)/", raw):
+        raw = "https://" + raw
+    elif re.fullmatch(r"[A-Za-z0-9_]{4,}", raw):
+        return "https://t.me/" + raw
+
+    parsed = urlparse(raw)
+    if parsed.scheme in ("http", "https") and parsed.netloc:
+        return raw
+    if parsed.scheme == "tg":
+        return raw
+    # آخرین تلاش امن: اگر کانال عمومی است از روی chat_id لینک ساخته می‌شود.
+    if chat_id.startswith("@"):
+        return "https://t.me/" + chat_id[1:]
+    return ""
+
 def _chat_member_is_joined(member):
     """تشخیص دقیق عضو بودن از روی پاسخ Bot API تلگرام."""
     status = str(getattr(member, "status", "") or "").lower()
@@ -274,10 +438,18 @@ def check_membership(uid, chans=None):
     return (len(not_joined) == 0), not_joined
 
 def send_join_message(chat_id, uid, not_joined=None, show_all=False):
-    chans = get_channels() if show_all else (not_joined if not_joined is not None else get_channels())
+    raw_chans = get_channels() if show_all else (not_joined if not_joined is not None else get_channels())
+    chans = []
+    for raw_ch in raw_chans or []:
+        ch = dict(raw_ch or {})
+        ch["chat_id"] = normalize_force_join_chat_id(ch.get("chat_id"))
+        ch["title"] = str(ch.get("title") or ch["chat_id"] or "کانال اجباری")
+        ch["url"] = normalize_force_join_url(ch.get("url"), ch["chat_id"])
+        chans.append(ch)
     kb = types.InlineKeyboardMarkup()
     for ch in chans:
-        kb.add(types.InlineKeyboardButton(f"📢 عضویت در {ch['title']}", url=ch["url"]))
+        if ch["url"]:
+            kb.add(types.InlineKeyboardButton(f"📢 عضویت در {ch['title']}", url=ch["url"]))
     kb.add(types.InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_join"))
     u = get_user(uid)
     if u and u["is_activated"]:
@@ -309,7 +481,27 @@ def send_join_message(chat_id, uid, not_joined=None, show_all=False):
             "⚠️ تا وقتی عضو همه کانال‌ها نشی و کپچا رو درست حل نکنی، حسابت فعال نمیشه، زیرمجموعه حساب نمیشی و نمی‌تونی از هیچ بخش ربات استفاده کنی.\n"
             "همچنین اگر بعداً از هر کانالی خارج بشی، دسترسی‌ات دوباره بسته میشه تا وقتی مجدد عضو بشی."
         )
-    bot.send_message(chat_id, text, reply_markup=kb)
+    try:
+        bot.send_message(chat_id, text, reply_markup=kb)
+        return True
+    except Exception:
+        # اگر تلگرام به هر دلیل دکمه/لینکی را رد کرد، کاربر نباید بی‌پاسخ بماند.
+        log("send_join_message failed; sending fallback", traceback.format_exc())
+        lines = [text, "", "🔗 <b>لینک‌های عضویت:</b>"]
+        for ch in chans:
+            if ch["url"]:
+                safe_url = html.escape(ch["url"], quote=True)
+                lines.append(f"• <a href=\"{safe_url}\">{esc(ch['title'])}</a>")
+            else:
+                lines.append(f"• {esc(ch['title'])}")
+        fallback_kb = types.InlineKeyboardMarkup()
+        fallback_kb.add(types.InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_join"))
+        try:
+            bot.send_message(chat_id, "\n".join(lines), reply_markup=fallback_kb, disable_web_page_preview=True)
+            return True
+        except Exception:
+            log("send_join_message fallback failed", traceback.format_exc())
+            return False
 
 def activate_user(uid, chat_id):
     """فعال‌سازی نهایی کاربر + پرداخت پاداش به معرف (فقط یک بار)"""
@@ -346,8 +538,32 @@ def activate_user(uid, chat_id):
         WELCOME.format(reward=reward, minwd=minwd),
         reply_markup=main_menu(uid))
 
+def send_setup_required(chat_id, uid):
+    """وقتی جوین اجباری فعال است ولی هیچ کانالی ثبت نشده، ربات fail-closed می‌ماند."""
+    global _last_setup_notice_at
+    clear_state(uid)
+    captcha_answers.pop(uid, None)
+    try:
+        bot.send_message(chat_id,
+            "⏳ <b>ربات در حال تکمیل راه‌اندازی است</b>\n\n"
+            "مدیریت هنوز کانال‌های جوین اجباری را در پنل ادمین ثبت نکرده است؛ به همین دلیل فعلاً هیچ بخشی باز نمی‌شود تا جوین اجباری دور زده نشود.\n\n"
+            "🙏 لطفاً چند دقیقه دیگر دوباره /start بزنید.")
+    except Exception:
+        log("send_setup_required failed", traceback.format_exc())
+    current = time.time()
+    if current - _last_setup_notice_at > 600:
+        _last_setup_notice_at = current
+        try:
+            bot.send_message(ADMIN_ID,
+                "⚠️ <b>هشدار راه‌اندازی جوین اجباری</b>\n\n"
+                "یک کاربر وارد ربات شد، اما هیچ کانال/گروه جوین اجباری در پنل ثبت نشده است.\n"
+                "از پنل ادمین، گزینه «➕ افزودن کانال جوین» را بزنید و حتماً ربات را در آن چت ادمین کنید؛ تا آن زمان کاربران پیام «در حال تکمیل راه‌اندازی» می‌بینند.")
+        except Exception:
+            pass
+    return False
+
 def access_gate(chat_id, uid):
-    """🔒 دروازه دسترسی دائمی ربات — FORCE-JOIN-V3
+    """🔒 دروازه دسترسی دائمی ربات — V4-CLEAN-FORCE-JOIN
 
     قبل از هر پیام، کامند، بخش منو و دکمه شیشه‌ای اجرا می‌شود:
     1) نمایش صفحه جوین اجباری در اولین ورود همه کاربران و دریافت تأیید صریح
@@ -368,6 +584,10 @@ def access_gate(chat_id, uid):
     force_join_enabled = get_int_setting("force_join_on", 1) == 1
     mandatory_channels = get_channels() if force_join_enabled else []
 
+    # نبودن کانال نباید راه میان‌بر به کپچا/منوی اصلی باشد.
+    if force_join_enabled and not mandatory_channels:
+        return send_setup_required(chat_id, uid)
+
     if mandatory_channels:
         # اول وضعیت واقعی عضویت بررسی می‌شود؛ هیچ کاربری مستقیم به کپچا نمی‌رسد.
         ok, not_joined = check_membership(uid, mandatory_channels)
@@ -379,7 +599,7 @@ def access_gate(chat_id, uid):
             send_join_message(chat_id, uid, not_joined)
             return False
 
-        # نکته کلیدی نسخه V3: حتی اگر کاربر از قبل عضو همه کانال‌ها باشد،
+        # نکته کلیدی نسخه V4: حتی اگر کاربر از قبل عضو همه کانال‌ها باشد،
         # تا وقتی join_confirmed او 1 نشده، صفحه همه کانال‌های اجباری با دکمه
         # بررسی عضویت نمایش داده می‌شود. پس اولین /start هیچ‌وقت مستقیم کپچا نیست.
         if not u.get("join_confirmed"):
@@ -405,51 +625,83 @@ def access_gate(chat_id, uid):
 
 def gate(chat_id, uid):
     """نام قدیمی دروازه ورود؛ برای سازگاری نگه داشته شده است."""
-    return access_gate(chat_id, uid)
+    return safe_access_gate(chat_id, uid)
+
+def safe_access_gate(chat_id, uid):
+    """نسخه ضدسکوت دروازه: هر خطای غیرمنتظره لاگ و به کاربر اعلام می‌شود."""
+    try:
+        return access_gate(chat_id, uid)
+    except Exception:
+        log("access_gate crashed", traceback.format_exc())
+        clear_state(uid)
+        captcha_answers.pop(uid, None)
+        try:
+            bot.send_message(chat_id,
+                "⚠️ <b>خطای موقت در بررسی دسترسی رخ داد</b>\n\n"
+                "لطفاً چند ثانیه صبر کنید و دوباره /start بزنید. اگر مشکل ادامه داشت، مدیریت از لاگ ربات آن را بررسی می‌کند.")
+        except Exception:
+            log("could not send access error to user", traceback.format_exc())
+        return False
 
 # ============================ کامندها ============================
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
     uid = message.from_user.id
-    clear_state(uid)
-    referrer_id = None
-    parts = (message.text or "").split()
-    if len(parts) > 1 and parts[1].startswith("ref_"):
+    chat_id = message.chat.id
+    log("/start received", "user=", uid, "chat=", chat_id)
+    try:
+        clear_state(uid)
+        referrer_id = None
+        parts = (message.text or "").split()
+        if len(parts) > 1 and parts[1].startswith("ref_"):
+            try:
+                rid = int(parts[1].replace("ref_", ""))
+                if rid != uid and get_user(rid):
+                    referrer_id = rid
+            except Exception:
+                referrer_id = None
+
+        existed = get_user(uid) is not None
+        u = ensure_user_record(
+            message.from_user,
+            referrer_id=referrer_id if not existed else None,
+            update_profile=True)
+        if not u:
+            raise RuntimeError("user record could not be created")
+
+        if not existed:
+            try:
+                bot.send_message(ADMIN_ID,
+                    f"🆕 <b>کاربر جدید وارد ربات شد</b>\n\n"
+                    f"👤 نام: {esc(message.from_user.first_name)}\n"
+                    f"🆔 آیدی عددی: <code>{uid}</code>\n"
+                    f"📎 یوزرنیم: @{esc(message.from_user.username or '—')}\n"
+                    f"🎁 معرف: <code>{referrer_id or '—'}</code>")
+            except Exception:
+                log("admin new-user notice failed", traceback.format_exc())
+
+        if u.get("is_banned") and not is_admin(uid):
+            bot.send_message(chat_id, BANNED_TEXT)
+            return
+        if get_int_setting("bot_on", 1) == 0 and not is_admin(uid):
+            bot.send_message(chat_id, BOT_OFF_TEXT)
+            return
+
+        # در هر /start برای کاربر عادی، قدیمی و زیرمجموعه جوین اجباری بررسی می‌شود.
+        if not is_admin(uid) and not safe_access_gate(chat_id, uid):
+            return
+
+        reward = get_int_setting("referral_reward", 100)
+        minwd = get_int_setting("min_withdraw", 800)
+        bot.send_message(chat_id, WELCOME.format(reward=reward, minwd=minwd),
+                         reply_markup=main_menu(uid))
+    except Exception:
+        log("cmd_start crashed", traceback.format_exc())
         try:
-            rid = int(parts[1].replace("ref_", ""))
-            if rid != uid and get_user(rid):
-                referrer_id = rid
+            bot.send_message(chat_id,
+                "⚠️ <b>خطای موقت رخ داد</b>\n\nلطفاً چند ثانیه صبر کنید و دوباره /start بزنید.")
         except Exception:
-            pass
-    u = get_user(uid)
-    if not u:
-        create_user(uid, message.from_user.username, message.from_user.first_name, referrer_id)
-        u = get_user(uid)
-        try:
-            bot.send_message(ADMIN_ID,
-                f"🆕 <b>کاربر جدید وارد ربات شد</b>\n\n"
-                f"👤 نام: {esc(message.from_user.first_name)}\n"
-                f"🆔 آیدی عددی: <code>{uid}</code>\n"
-                f"📎 یوزرنیم: @{esc(message.from_user.username or '—')}\n"
-                f"🎁 معرف: <code>{referrer_id or '—'}</code>")
-        except Exception:
-            pass
-    else:
-        update_user(uid, username=message.from_user.username or "",
-                    first_name=message.from_user.first_name or "")
-    if u["is_banned"] and not is_admin(uid):
-        bot.send_message(message.chat.id, BANNED_TEXT)
-        return
-    if get_int_setting("bot_on", 1) == 0 and not is_admin(uid):
-        bot.send_message(message.chat.id, BOT_OFF_TEXT)
-        return
-    # در هر /start عضویت همه کاربران (عادی، قدیمی و زیرمجموعه) دوباره بررسی می‌شود
-    if not is_admin(uid) and not access_gate(message.chat.id, uid):
-        return
-    reward = get_int_setting("referral_reward", 100)
-    minwd = get_int_setting("min_withdraw", 800)
-    bot.send_message(message.chat.id, WELCOME.format(reward=reward, minwd=minwd),
-                     reply_markup=main_menu(uid))
+            log("could not send cmd_start error", traceback.format_exc())
 
 @bot.message_handler(commands=["admin"])
 def cmd_admin(message):
@@ -459,38 +711,42 @@ def cmd_admin(message):
 @bot.message_handler(commands=["cancel"])
 def cmd_cancel(message):
     uid = message.from_user.id
-    if not get_user(uid):
-        create_user(uid, message.from_user.username, message.from_user.first_name)
+    ensure_user_record(message.from_user)
     clear_state(uid)
     bot.send_message(message.chat.id, "❌ عملیات لغو شد.")
     # حتی بعد از لغو هم کاربر غیرعضو به منوی اصلی و بخش‌ها دسترسی ندارد
-    if is_admin(uid) or access_gate(message.chat.id, uid):
+    if is_admin(uid) or safe_access_gate(message.chat.id, uid):
         bot.send_message(message.chat.id, "🏠 <b>منوی اصلی</b>", reply_markup=main_menu(uid))
 
 @bot.message_handler(commands=["id"])
 def cmd_id(message):
     uid = message.from_user.id
-    if not get_user(uid):
-        create_user(uid, message.from_user.username, message.from_user.first_name)
-    u = get_user(uid)
+    u = ensure_user_record(message.from_user)
     if not is_admin(uid):
-        if u and u["is_banned"]:
+        if u and u.get("is_banned"):
             bot.send_message(message.chat.id, BANNED_TEXT)
             return
         if get_int_setting("bot_on", 1) == 0:
             bot.send_message(message.chat.id, BOT_OFF_TEXT)
             return
-        if not access_gate(message.chat.id, uid):
+        if not safe_access_gate(message.chat.id, uid):
             return
     bot.reply_to(message, f"🆔 آیدی عددی شما: <code>{uid}</code>")
 
 def admin_panel_text():
     on = "🟢 روشن" if get_int_setting("bot_on", 1) == 1 else "🔴 خاموش"
+    channel_count = len(get_channels())
+    setup_warning = ""
+    if get_int_setting("force_join_on", 1) == 1 and channel_count == 0:
+        setup_warning = ("\n⚠️ <b>هیچ کانال جوین اجباری ثبت نشده است!</b>\n"
+                         "کاربران فعلاً پیام «در حال تکمیل راه‌اندازی» می‌بینند. اول از گزینه افزودن کانال استفاده کنید.\n")
     return (f"🛠 <b>پنل مدیریت ربات</b> 🐶\n\n"
             f"🧩 نسخه در حال اجرا: <code>{BOT_VERSION}</code>\n"
             f"وضعیت ربات: {on}\n"
+            f"📢 کانال‌های جوین اجباری: <b>{channel_count}</b>\n"
             f"🎁 پاداش زیرمجموعه: <b>{get_int_setting('referral_reward',100)} داگز</b>\n"
-            f"💰 حداقل برداشت: <b>{get_int_setting('min_withdraw',800)} داگز</b>\n\n"
+            f"💰 حداقل برداشت: <b>{get_int_setting('min_withdraw',800)} داگز</b>\n"
+            f"{setup_warning}\n"
             f"👇 یکی از گزینه‌های زیر را انتخاب کنید:")
 
 # ============================ متن حساب کاربری و... ============================
@@ -644,11 +900,7 @@ def restore_from_json(file_bytes):
     conn.close()
 
 def normalize_chat_id(raw):
-    raw = (raw or "").strip()
-    m = re.match(r"https?://t\.me/([A-Za-z0-9_]+)", raw)
-    if m:
-        return "@" + m.group(1)
-    return raw
+    return normalize_force_join_chat_id(raw)
 
 # ============================ پردازش State ها ============================
 def handle_state(message, state):
@@ -821,25 +1073,47 @@ def handle_state(message, state):
 
     if step == "add_channel_id":
         chat_raw = normalize_chat_id(text)
-        title = chat_raw
+        if not chat_raw:
+            bot.send_message(chat_id, "❌ آیدی کانال/گروه خالی است؛ دوباره بفرستید یا /cancel بزنید.")
+            return
         try:
             chinfo = bot.get_chat(chat_raw)
             title = chinfo.title or chat_raw
-        except Exception:
-            pass
+            me = bot.get_me()
+            bot_member = bot.get_chat_member(chat_raw, me.id)
+            bot_status = str(getattr(bot_member, "status", "")).lower()
+            if bot_status not in ("creator", "administrator", "member"):
+                bot.send_message(chat_id,
+                    "❌ <b>ربات به این کانال/گروه دسترسی ندارد و کانال ثبت نشد.</b>\n\n"
+                    "اول ربات را در کانال/گروه عضو و <b>ادمین</b> کنید، سپس همین آیدی را دوباره بفرستید.\n"
+                    f"وضعیت فعلی ربات: <code>{esc(bot_status or 'unknown')}</code>")
+                return
+            if bot_status == "member":
+                bot.send_message(chat_id,
+                    "⚠️ ربات فعلاً فقط عضو است؛ برای بررسی مطمئن عضویت در کانال، آن را <b>ادمین</b> کنید. ادامه ثبت انجام می‌شود.")
+        except Exception as e:
+            log("add channel validation failed", traceback.format_exc())
+            bot.send_message(chat_id,
+                "❌ <b>کانال/گروه پیدا یا بررسی نشد و ثبت انجام نشد.</b>\n\n"
+                "مطمئن شوید آیدی درست است و ربات داخل آن چت عضو و ادمین شده است، سپس دوباره آیدی را بفرستید.\n"
+                f"خطا: <code>{esc(str(e)[:250])}</code>")
+            return
         data.update({"chat_id": chat_raw, "title": title})
         set_state(uid, "add_channel_url", data)
         bot.send_message(chat_id,
-            f"✅ کانال/گروه: <b>{esc(title)}</b> (<code>{esc(chat_raw)}</code>)\n\n"
+            f"✅ کانال/گروه تأیید شد: <b>{esc(title)}</b> (<code>{esc(chat_raw)}</code>)\n\n"
             f"🔗 حالا <b>لینک عضویت</b> را بفرستید (مثلاً <code>https://t.me/YourChannel</code> یا لینک دعوت خصوصی).\n"
-            f"اگر کانال عمومی است و می‌خواهید لینک خودکار ساخته شود، بنویسید: <code>خودکار</code>\n\n"
-            f"⚠️ یادتان نرود ربات باید در آن کانال/گروه <b>ادمین</b> باشد تا عضویت بررسی شود!")
+            f"برای کانال عمومی می‌توانید یوزرنیم، لینک کامل یا کلمه <code>خودکار</code> را بفرستید.")
         return
 
     if step == "add_channel_url":
-        url = text
-        if url in ("خودکار", "auto"):
-            url = "https://t.me/" + str(data["chat_id"]).replace("@", "")
+        url = normalize_force_join_url(text, data.get("chat_id"))
+        if not url:
+            bot.send_message(chat_id,
+                "❌ <b>لینک عضویت معتبر نیست و کانال ثبت نشد.</b>\n\n"
+                "لینک کامل مثل <code>https://t.me/YourChannel</code> یا لینک دعوت خصوصی معتبر بفرستید. "
+                "گزینه «خودکار» فقط برای کانال عمومی با یوزرنیم کار می‌کند؛ برای چت خصوصی حتماً لینک دعوت لازم است.")
+            return
         conn = get_conn()
         conn.execute("INSERT INTO channels(chat_id,title,url) VALUES(?,?,?)",
                      (data["chat_id"], data["title"], url))
@@ -1002,12 +1276,19 @@ def main_handler(message):
     chat_id = message.chat.id
     text = (message.text or "").strip()
 
-    u = get_user(uid)
-    if not u:
-        create_user(uid, message.from_user.username, message.from_user.first_name)
-        u = get_user(uid)
+    try:
+        u = ensure_user_record(message.from_user)
+        if not u:
+            raise RuntimeError("user record could not be created")
+    except Exception:
+        log("main_handler ensure_user failed", traceback.format_exc())
+        try:
+            bot.send_message(chat_id, "⚠️ خطای موقت رخ داد؛ لطفاً دوباره /start بزنید.")
+        except Exception:
+            pass
+        return
 
-    if u["is_banned"] and not is_admin(uid):
+    if u.get("is_banned") and not is_admin(uid):
         bot.send_message(chat_id, BANNED_TEXT)
         return
     if get_int_setting("bot_on", 1) == 0 and not is_admin(uid):
@@ -1017,7 +1298,7 @@ def main_handler(message):
     # 🔒 بررسی دائمی و همگانی جوین اجباری قبل از هر بخش و حتی قبل از ادامه
     # عملیات‌های نیمه‌تمام (مثل واردکردن مبلغ یا آیدی برداشت و پشتیبانی).
     # اگر کاربر از هر کانال خارج شده باشد، همین‌جا متوقف و صفحه عضویت نمایش داده می‌شود.
-    if not is_admin(uid) and not access_gate(chat_id, uid):
+    if not is_admin(uid) and not safe_access_gate(chat_id, uid):
         return
 
     # State در جریان — فقط بعد از تأیید عضویت کامل پردازش می‌شود
@@ -1278,13 +1559,19 @@ def callbacks(call):
     chat_id = call.message.chat.id
     data = call.data or ""
 
-    if not get_user(uid):
-        create_user(uid, call.from_user.username, call.from_user.first_name)
-    u_cb = get_user(uid)
+    try:
+        u_cb = ensure_user_record(call.from_user)
+    except Exception:
+        log("callback ensure_user failed", traceback.format_exc())
+        try:
+            bot.answer_callback_query(call.id, "⚠️ خطای موقت؛ دوباره /start بزنید.", show_alert=True)
+        except Exception:
+            pass
+        return
 
     # هیچ دکمه شیشه‌ای برای کاربر مسدود یا هنگام خاموشی ربات پردازش نمی‌شود
     if not is_admin(uid):
-        if u_cb and u_cb["is_banned"]:
+        if u_cb and u_cb.get("is_banned"):
             bot.answer_callback_query(call.id, "🚫 حساب شما مسدود است.", show_alert=True)
             return
         if get_int_setting("bot_on", 1) == 0:
@@ -1295,7 +1582,7 @@ def callbacks(call):
     # کنترل می‌شوند) ابتدا از دروازه جوین اجباری رد می‌شوند. بنابراین کاربری که
     # کانالی را ترک کرده نمی‌تواند با دکمه‌های قدیمی، مثلاً ادامه برداشت، جلو برود.
     if not is_admin(uid) and data != "check_join" and not data.startswith("cap:"):
-        if not access_gate(chat_id, uid):
+        if not safe_access_gate(chat_id, uid):
             bot.answer_callback_query(
                 call.id,
                 "🔒 ابتدا باید عضو همه کانال‌های اجباری شوید تا بتوانید از ربات استفاده کنید.",
@@ -1533,22 +1820,45 @@ def callbacks(call):
 # ============================ وب‌سرور Render ============================
 @app.route("/", methods=["GET"])
 def index():
-    return "🐶 DOGS Bot is running ✅", 200
+    try:
+        return f"🐶 DOGS Bot {BOT_VERSION} is running ✅ | force-join channels: {len(get_channels())}", 200
+    except Exception:
+        return f"🐶 DOGS Bot {BOT_VERSION} is running ✅", 200
 
 @app.route("/health", methods=["GET"])
 def health():
-    return "ok", 200
+    return f"ok {BOT_VERSION}", 200
 
 @app.route("/" + TOKEN, methods=["POST"])
 def webhook():
+    update = None
     try:
         update = types.Update.de_json(request.get_data().decode("utf-8"))
+        log("webhook update received", "update_id=", getattr(update, "update_id", "?"))
         bot.process_new_updates([update])
-    except Exception as e:
-        print("Webhook error:", e)
+    except Exception:
+        log("webhook processing crashed", traceback.format_exc())
+        # آخرین تلاش برای اینکه کاربر کاملاً بی‌پاسخ نماند.
+        try:
+            msg = None
+            if update is not None:
+                msg = getattr(update, "message", None)
+                if msg is None and getattr(update, "callback_query", None):
+                    msg = update.callback_query.message
+            if msg is not None:
+                bot.send_message(msg.chat.id, "⚠️ خطای موقت رخ داد؛ لطفاً دوباره /start بزنید.")
+        except Exception:
+            log("webhook error reply failed", traceback.format_exc())
     return "ok", 200
 
 init_db()
+try:
+    _conn = get_conn()
+    _users_count = _conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    _conn.close()
+    log("database ready", "db=", DB_PATH, "users=", _users_count, "channels=", len(get_channels()))
+except Exception:
+    log("startup diagnostics failed", traceback.format_exc())
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
@@ -1558,10 +1868,10 @@ if __name__ == "__main__":
         bot.remove_webhook()
         time.sleep(1)
         bot.set_webhook(url=webhook_url.rstrip("/") + "/" + TOKEN)
-        print(f"✅ Bot version {BOT_VERSION} | Webhook set:", webhook_url)
-        app.run(host="0.0.0.0", port=port)
+        log("webhook set", webhook_url)
+        app.run(host="0.0.0.0", port=port, threaded=True)
     else:
         bot.remove_webhook()
-        print(f"✅ Bot version {BOT_VERSION} started with Polling (local mode)")
+        log("started with polling (local mode)")
         threading.Thread(target=lambda: bot.infinity_polling(skip_pending=True), daemon=True).start()
-        app.run(host="0.0.0.0", port=port)
+        app.run(host="0.0.0.0", port=port, threaded=True)
