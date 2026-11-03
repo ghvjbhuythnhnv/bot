@@ -31,6 +31,12 @@ except Exception as _e:
     TelegramClient = None
     events = None
     StringSession = None
+
+    class _TelethonMissing(Exception):
+        pass
+    SessionPasswordNeededError = _TelethonMissing
+    PhoneCodeInvalidError = _TelethonMissing
+    UpdateProfileRequest = None
     print("[SELF-DARK] Telethon import failed:", _e, flush=True)
 
 try:
@@ -42,7 +48,7 @@ except Exception:
 # ============================================================
 # تنظیمات اصلی (با مقادیر پیش‌فرض داخل کد؛ بدون نیاز به Env)
 # ============================================================
-BOT_VERSION = "SELF-DARK-V1.2"
+BOT_VERSION = "SELF-DARK-V1.3"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8315326974:AAGnH1KEiDKw93u-JBV23OrPOe_jQYpTwXw").strip()
 try:
     ADMIN_ID = int(os.environ.get("ADMIN_ID", "8248647747"))
@@ -993,7 +999,25 @@ def cmd_start(m):
 @bot.message_handler(commands=["cancel"])
 def cmd_cancel(m):
     try:
-        clear_state(m.from_user.id)
+        uid = int(m.from_user.id)
+        st = get_state(uid)
+        if st.get("step") in ("self_phone", "self_code", "self_2fa"):
+            if st.get("acc_id"):
+                try:
+                    dispose_login_session(int(st["acc_id"]))
+                except Exception:
+                    pass
+            try:
+                with _db_lock:
+                    conn = get_conn()
+                    conn.execute("UPDATE self_accounts SET login_step='none' WHERE user_id=? "
+                                 "AND (session_string IS NULL OR session_string='') "
+                                 "AND login_step IN ('await_phone','await_code','await_2fa')", (uid,))
+                    conn.commit()
+                    conn.close()
+            except Exception:
+                pass
+        clear_state(uid)
         bot.send_message(m.chat.id, "❌ عملیات لغو شد.", reply_markup=main_menu_kb(m.from_user.id))
     except Exception:
         pass
@@ -2269,6 +2293,49 @@ def close_thread_loop():
         pass
 
 
+# ---------- مدیر نشست‌های ورود (یک اتصال زنده برای کل لاگین) ----------
+login_sessions = {}
+login_sessions_lock = threading.RLock()
+LOGIN_TTL = 15 * 60
+
+
+def dispose_login_session(acc_id):
+    """بستن اتصال موقت ورود (بعد از موفقیت، لغو یا انقضا)."""
+    with login_sessions_lock:
+        info = login_sessions.pop(int(acc_id), None)
+    if info and info.get("loop"):
+        try:
+            info["loop"].call_soon_threadsafe(info["loop"].stop)
+        except Exception:
+            pass
+
+
+def _get_login_session(acc_id):
+    with login_sessions_lock:
+        return login_sessions.get(int(acc_id))
+
+
+def login_janitor():
+    """پاک‌سازی نشست‌های ورود منقضی‌شده."""
+    while True:
+        try:
+            time.sleep(300)
+            now = time.time()
+            expired = []
+            with login_sessions_lock:
+                for aid, info in list(login_sessions.items()):
+                    if now > float(info.get("expires", 0) or 0):
+                        expired.append(aid)
+            for aid in expired:
+                dispose_login_session(aid)
+                try:
+                    update_self_account(aid, login_step="none")
+                except Exception:
+                    pass
+        except Exception:
+            time.sleep(300)
+
+
 def normalize_phone(s):
     s = fa_to_en(s).strip().replace(" ", "").replace("-", "")
     if s.startswith("00"):
@@ -2460,45 +2527,78 @@ def st_self_phone(uid, text, m):
 
 
 def self_do_send_code(uid, acc_id, phone, chat_id):
+    """ترد اختصاصی ورود: اتصال را تا پایان لاگین (کد/رمز) زنده نگه می‌دارد.
+    ارسال کد و تأیید آن باید روی یک سشن واحد باشد، وگرنه تلگرام خطای
+    PHONE_CODE_EXPIRED می‌دهد؛ پس این ترد بعد از ارسال کد با run_forever
+    زنده می‌ماند و مراحل بعد روی همان loop اجرا می‌شوند."""
     if not TELETHON_OK:
         return
-    ensure_thread_loop()
-    client = None
+    dispose_login_session(acc_id)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    from telethon import TelegramClient as _A
+    client = _A(StringSession(), API_ID, API_HASH)
+    sent_ok = False
     try:
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
-        client.connect()
+        loop.run_until_complete(_A.connect(client))
         if not client.is_connected():
             raise RuntimeError("اتصال به تلگرام برقرار نشد")
-        sent = client.send_code_request(phone)
+        sent = loop.run_until_complete(_A.send_code_request(client, phone))
         update_self_account(acc_id, phone=phone, temp_phone=phone,
                             phone_code_hash=sent.phone_code_hash, login_step="await_code")
+        with login_sessions_lock:
+            login_sessions[int(acc_id)] = {"client": client, "loop": loop, "phone": phone,
+                                           "expires": time.time() + LOGIN_TTL}
+        sent_ok = True
         set_state(uid, "self_code", acc_id=acc_id)
         bot.send_message(chat_id, panel_box("🔑 کد ورود", [
             f"📱 کد ورود به <code>{esc(phone)}</code> ارسال شد.",
             "",
             "✍️ <b>کد ورود را بفرست:</b> (با فاصله یا بدون فاصله)",
             "مثلاً: <code>4 2 8 1 9</code>",
+            "",
+            "⏰ <i>کد فقط چند دقیقه معتبر است؛ زود بفرست!</i>",
         ]), parse_mode="HTML")
+        log(f"login code sent acc={acc_id} uid={uid}")
+        loop.run_forever()
     except Exception as e:
         log("send_code err", repr(e)[:300])
-        msg = str(e)
-        if "PHONE_NUMBER_INVALID" in msg:
-            t = "⚠️ شماره نامعتبر است! دوباره بفرست."
-        elif "FLOOD" in msg:
-            t = "⚠️ محدودیت تلگرام! چند دقیقه بعد تلاش کن."
-        else:
-            t = f"⚠️ خطا در ارسال کد! ({esc(msg[:150])})"
-        try:
-            bot.send_message(chat_id, t, parse_mode="HTML")
-        except Exception:
-            pass
+        if not sent_ok:
+            msg = str(e)
+            if "PHONE_NUMBER_INVALID" in msg:
+                t = "⚠️ شماره نامعتبر است! دوباره بفرست."
+            elif "FLOOD" in msg:
+                t = "⚠️ محدودیت تلگرام! چند دقیقه بعد تلاش کن."
+            else:
+                t = f"⚠️ خطا در ارسال کد! ({esc(msg[:150])})"
+            try:
+                bot.send_message(chat_id, t, parse_mode="HTML")
+            except Exception:
+                pass
+            try:
+                update_self_account(acc_id, login_step="await_phone")
+            except Exception:
+                pass
     finally:
+        with login_sessions_lock:
+            login_sessions.pop(int(acc_id), None)
         try:
-            if client:
-                client.disconnect()
+            if loop.is_running():
+                loop.stop()
         except Exception:
             pass
-        close_thread_loop()
+        try:
+            loop.run_until_complete(_A.disconnect(client))
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+        try:
+            asyncio.set_event_loop(None)
+        except Exception:
+            pass
 
 
 @register_state("self_code")
@@ -2514,44 +2614,83 @@ def st_self_code(uid, text, m):
 
 
 def self_do_sign_in(uid, acc_id, code, chat_id):
-    ensure_thread_loop()
-    client = None
-    try:
-        acc = get_self_account_by_id(acc_id)
-        if not acc:
-            return
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
-        client.connect()
+    """تأیید کد روی همان اتصال زنده‌ای که کد را فرستاد."""
+    acc = get_self_account_by_id(acc_id)
+    if not acc:
+        return
+    info = _get_login_session(acc_id)
+    if not info:
         try:
-            client.sign_in(acc["phone"] or acc["temp_phone"], code, phone_code_hash=acc["phone_code_hash"])
-        except SessionPasswordNeededError:
-            update_self_account(acc_id, login_step="await_2fa")
-            with _db_lock:
-                conn = get_conn()
-                conn.execute("UPDATE self_accounts SET label=? WHERE id=?", (code[-8:], acc_id))
-                conn.commit()
-                conn.close()
-            set_state(uid, "self_2fa", acc_id=acc_id)
-            bot.send_message(chat_id, "🔐 اکانتت <b>رمز دومرحله‌ای</b> دارد!\n✍️ رمزش را بفرست:", parse_mode="HTML")
-            return
-        except PhoneCodeInvalidError:
+            update_self_account(acc_id, login_step="await_phone")
+        except Exception:
+            pass
+        set_state(uid, "self_phone", acc_id=acc_id)
+        try:
+            bot.send_message(chat_id, "⚠️ اتصال ورود قطع شده (ری‌استارت سرور یا انقضای ۱۵ دقیقه)!\n📱 شماره را دوباره بفرست:")
+        except Exception:
+            pass
+        return
+    client, loop = info["client"], info["loop"]
+    from telethon import TelegramClient as _A
+    try:
+        phone = info.get("phone") or acc["phone"] or acc["temp_phone"]
+        fut = asyncio.run_coroutine_threadsafe(
+            _A.sign_in(client, phone, code, phone_code_hash=acc["phone_code_hash"]), loop)
+        fut.result(timeout=90)
+    except SessionPasswordNeededError:
+        update_self_account(acc_id, login_step="await_2fa")
+        set_state(uid, "self_2fa", acc_id=acc_id)
+        try:
+            bot.send_message(chat_id, panel_box("🔐 رمز دومرحله‌ای", [
+                "اکانتت <b>رمز دومرحله‌ای</b> دارد!",
+                "✍️ رمزش را بفرست:",
+            ]), parse_mode="HTML")
+        except Exception:
+            pass
+        return
+    except PhoneCodeInvalidError:
+        try:
             bot.send_message(chat_id, "❌ کد اشتباه است! دوباره بفرست:")
-            return
-        self_finalize_login(uid, acc_id, client, chat_id)
-        client = None
+        except Exception:
+            pass
+        return
     except Exception as e:
         log("sign_in err", repr(e)[:300])
+        msg = str(e)
+        if "EXPIRED" in msg.upper():
+            t = "⏰ کد منقضی شده! /cancel بزن و از اول شروع کن."
+            dispose_login_session(acc_id)
+            try:
+                update_self_account(acc_id, login_step="none")
+            except Exception:
+                pass
+            clear_state(uid)
+        elif "FLOOD" in msg:
+            t = "⚠️ محدودیت تلگرام! چند دقیقه بعد با /cancel و شروع دوباره تلاش کن."
+        else:
+            t = f"⚠️ ورود ناموفق! ({esc(msg[:150])}) — /cancel برای شروع دوباره"
         try:
-            bot.send_message(chat_id, f"⚠️ ورود ناموفق! ({esc(str(e)[:150])})\n/cancel برای شروع دوباره", parse_mode="HTML")
+            bot.send_message(chat_id, t, parse_mode="HTML")
         except Exception:
             pass
-    finally:
+        return
+    try:
+        session_str = client.session.save()
+    except Exception as e:
+        log("finalize save err", repr(e)[:200])
         try:
-            if client:
-                client.disconnect()
+            bot.send_message(chat_id, "⚠️ ذخیره نشست ناموفق بود! /cancel و دوباره تلاش کن.")
         except Exception:
             pass
-        close_thread_loop()
+        return
+    my_name = ""
+    try:
+        me = asyncio.run_coroutine_threadsafe(_A.get_me(client), loop).result(timeout=30)
+        my_name = getattr(me, "first_name", "") or ""
+    except Exception:
+        pass
+    dispose_login_session(acc_id)
+    self_finalize_with_session(uid, acc_id, session_str, my_name, chat_id)
 
 
 @register_state("self_2fa")
@@ -2563,52 +2702,64 @@ def st_self_2fa(uid, text, m):
 
 
 def self_do_2fa(uid, acc_id, pw, chat_id):
-    ensure_thread_loop()
-    client = None
-    try:
-        acc = get_self_account_by_id(acc_id)
-        if not acc:
-            return
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
-        client.connect()
+    """تأیید رمز دومرحله‌ای روی همان اتصال زنده ورود."""
+    acc = get_self_account_by_id(acc_id)
+    if not acc:
+        return
+    info = _get_login_session(acc_id)
+    if not info:
         try:
-            client.sign_in(acc["phone"] or acc["temp_phone"], acc.get("label") or "", phone_code_hash=acc["phone_code_hash"])
-        except SessionPasswordNeededError:
-            client.sign_in(password=pw)
-        self_finalize_login(uid, acc_id, client, chat_id)
-        client = None
-    except Exception as e:
-        log("2fa err", repr(e)[:300])
-        try:
-            bot.send_message(chat_id, "❌ رمز دومرحله‌ای اشتباه است! دوباره بفرست:")
+            update_self_account(acc_id, login_step="await_phone")
         except Exception:
             pass
-    finally:
+        set_state(uid, "self_phone", acc_id=acc_id)
         try:
-            if client:
-                client.disconnect()
-        except Exception:
-            pass
-        close_thread_loop()
-
-
-def self_finalize_login(uid, acc_id, client, chat_id):
-    try:
-        session_str = client.session.save()
-        me = client.get_me()
-        my_name = getattr(me, "first_name", "") or ""
-    except Exception as e:
-        log("finalize err", repr(e)[:200])
-        try:
-            bot.send_message(chat_id, "⚠️ ذخیره نشست ناموفق بود! دوباره تلاش کن.")
+            bot.send_message(chat_id, "⚠️ اتصال ورود قطع شد! 📱 شماره را دوباره بفرست:")
         except Exception:
             pass
         return
-    finally:
+    client, loop = info["client"], info["loop"]
+    from telethon import TelegramClient as _A
+    try:
+        fut = asyncio.run_coroutine_threadsafe(_A.sign_in(client, password=pw), loop)
+        fut.result(timeout=90)
+    except Exception as e:
+        log("2fa err", repr(e)[:300])
+        msg = str(e)
+        if "PASSWORD_HASH_INVALID" in msg or "password" in msg.lower():
+            t = "❌ رمز دومرحله‌ای اشتباه است! دوباره بفرست:"
+        else:
+            t = f"⚠️ خطا! ({esc(msg[:150])}) دوباره بفرست یا /cancel"
         try:
-            client.disconnect()
+            bot.send_message(chat_id, t, parse_mode="HTML")
         except Exception:
             pass
+        return
+    try:
+        session_str = client.session.save()
+    except Exception:
+        try:
+            bot.send_message(chat_id, "⚠️ ذخیره نشست ناموفق بود! /cancel و دوباره تلاش کن.")
+        except Exception:
+            pass
+        return
+    my_name = ""
+    try:
+        me = asyncio.run_coroutine_threadsafe(_A.get_me(client), loop).result(timeout=30)
+        my_name = getattr(me, "first_name", "") or ""
+    except Exception:
+        pass
+    dispose_login_session(acc_id)
+    self_finalize_with_session(uid, acc_id, session_str, my_name, chat_id)
+
+
+def self_finalize_with_session(uid, acc_id, session_str, display_name, chat_id):
+    if not session_str:
+        try:
+            bot.send_message(chat_id, "⚠️ ذخیره نشست ناموفق بود! /cancel و دوباره تلاش کن.")
+        except Exception:
+            pass
+        return
     cost = f_setting("self_cost", D_SELF_COST)
     u = get_user(uid) or {}
     bal = float(u.get("diamonds", 0) or 0)
@@ -2622,9 +2773,6 @@ def self_finalize_login(uid, acc_id, client, chat_id):
     update_user(uid, total_spent=float(u.get("total_spent", 0) or 0) + cost)
     update_self_account(acc_id, session_string=session_str, is_on=1, login_step="done",
                         activated_at=now_str(), last_billing=now_str(), label="")
-    for key, _n, _t, _d in FEATURES:
-        if get_toggle(uid, key) == (0, ""):
-            pass
     for k in ("save_deleted", "save_edits", "smart_guard", "chat_stats", "tabchi"):
         on, ex = get_toggle(uid, k)
         if not on:
@@ -2632,7 +2780,7 @@ def self_finalize_login(uid, acc_id, client, chat_id):
     clear_state(uid)
     try:
         bot.send_message(chat_id, panel_box("🎉 سلف فعال شد!", [
-            f"👤 اکانت: {esc(my_name)}",
+            f"👤 اکانت: {esc(display_name)}",
             f"📱 {esc(get_self_account_by_id(acc_id).get('phone') or '')}",
             f"💎 هزینه کم شد: {fmt_num(cost)} | ⏳ ساعتی: {fmt_num(f_setting('hourly_fee', D_HOURLY_FEE))}",
             "",
@@ -3556,6 +3704,15 @@ def daily_loop():
 def restore_saved_selfs():
     time.sleep(8)
     try:
+        with _db_lock:
+            conn = get_conn()
+            conn.execute("UPDATE self_accounts SET login_step='none' WHERE login_step IN "
+                         "('await_phone','await_code','await_2fa')")
+            conn.commit()
+            conn.close()
+    except Exception:
+        pass
+    try:
         conn = get_conn()
         rows = conn.execute("SELECT id FROM self_accounts WHERE is_on=1").fetchall()
         conn.close()
@@ -3608,7 +3765,7 @@ if __name__ == "__main__":
     ensure_extra_tables()
     log("starting", BOT_VERSION, "| telethon:", TELETHON_OK, "| admin:", ADMIN_ID)
     for fn, name in [(billing_loop, "billing"), (tabchi_loop, "tabchi"), (bio_name_loop, "bio"),
-                     (reminders_loop, "reminders"), (scheduled_loop, "scheduled"), (daily_loop, "daily")]:
+                     (reminders_loop, "reminders"), (scheduled_loop, "scheduled"), (daily_loop, "daily"), (login_janitor, "login-janitor")]:
         threading.Thread(target=fn, name=name, daemon=True).start()
     threading.Thread(target=restore_saved_selfs, daemon=True).start()
     base = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
