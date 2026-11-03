@@ -51,7 +51,7 @@ except Exception:
 # ============================================================
 # تنظیمات اصلی (با مقادیر پیش‌فرض داخل کد؛ بدون نیاز به Env)
 # ============================================================
-BOT_VERSION = "SELF-DARK-V1.4"
+BOT_VERSION = "SELF-DARK-V1.5"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8315326974:AAGnH1KEiDKw93u-JBV23OrPOe_jQYpTwXw").strip()
 try:
     ADMIN_ID = int(os.environ.get("ADMIN_ID", "8248647747"))
@@ -110,6 +110,12 @@ FEATURES = [
     ("notif_manage", 28, "مدیریت هوشمند اعلان‌ها", "بی‌صدا کردن خودکار گروه‌های شلوغ"),
     ("tabchi", 29, "تبچی خودکار گروه‌ها", "ارسال خودکار بنر و متن"),
     ("smart_guard", 30, "نگهبان هوشمند سلف", "محافظت از سلف + هشدار ورود"),
+    ("anti_spam", 31, "ضداسپم پی‌وی", "هشدار و گزارش اسپمرها به مالک"),
+    ("silent_hours", 32, "ساعات سکوت", "توقف پاسخ خودکار در ساعات مشخص"),
+    ("pv_welcome", 33, "خوش‌آمد پی‌وی جدید", "پیام خوش‌آمد به چت‌های تازه"),
+    ("auto_react", 34, "ری‌اکشن خودکار", "ری‌اکشن خودکار به پیام‌های پی‌وی"),
+    ("keyword_alert", 35, "هشدار کلمه کلیدی", "خبررسانی به مالک با دیدن کلمات خاص"),
+    ("typing_effect", 36, "افکت تایپینگ", "نمایش «در حال نوشتن...» قبل از پاسخ"),
 ]
 FEATURE_KEYS = {k for k, _, _, _ in FEATURES}
 FEATURE_BY_KEY = {k: (n, t, d) for k, n, t, d in FEATURES}
@@ -878,17 +884,18 @@ def self_main_kb(uid):
 
 
 def features_kb(uid, page):
-    page = max(0, min(2, int(page)))
+    page = max(0, min(3, int(page)))
     kb = types.InlineKeyboardMarkup(row_width=1)
     chunk = FEATURES[page * 10:(page + 1) * 10]
     for key, num, title, _d in chunk:
         on, _ex = get_toggle(uid, key)
         mark = "🟢" if on else "🔴"
-        kb.add(types.InlineKeyboardButton(f"{mark} {num}. {title}", callback_data=f"t:{key}:{page}"))
+        kb.row(types.InlineKeyboardButton(f"{mark} {num}. {title}", callback_data=f"t:{key}:{page}"),
+               types.InlineKeyboardButton("⚙️", callback_data=f"c:{key}:{page}"))
     nav = []
     if page > 0:
         nav.append(types.InlineKeyboardButton("◀️ قبلی", callback_data=f"f:{page - 1}"))
-    if page < 2:
+    if page < 3:
         nav.append(types.InlineKeyboardButton("بعدی ▶️", callback_data=f"f:{page + 1}"))
     if nav:
         kb.row(*nav)
@@ -897,10 +904,11 @@ def features_kb(uid, page):
 
 
 def features_text(page):
-    page = max(0, min(2, int(page)))
-    names = ["اول", "دوم", "سوم"]
-    rows = [f"📄 صفحه {names[page]} (۱۰ قابلیت) — برای روشن/خاموش روی هرکدام بزن:", ""]
-    for key, num, title, desc in FEATURES[page * 10:(page + 1) * 10]:
+    page = max(0, min(3, int(page)))
+    names = ["اول", "دوم", "سوم", "چهارم"]
+    chunk = FEATURES[page * 10:(page + 1) * 10]
+    rows = [f"📄 صفحه {names[page]} ({len(chunk)} قابلیت از {len(FEATURES)})", "🟢/🔴 = روشن/خاموش | ⚙️ = تنظیمات تکی", ""]
+    for key, num, title, desc in chunk:
         rows.append(f"<b>{num}. {esc(title)}</b>\n   <i>{esc(desc)}</i>")
     return panel_box("⚙️ قابلیت‌های سلف", rows)
 
@@ -1335,6 +1343,100 @@ def all_callbacks(call):
                 except Exception:
                     pass
             return
+        if data.startswith("c:"):
+            try:
+                _p, key, page = data.split(":")
+            except Exception:
+                bot.answer_callback_query(call.id)
+                return
+            if key in FEATURE_KEYS:
+                show_feat_config(call, key, int(page))
+            bot.answer_callback_query(call.id)
+            return
+        if data.startswith("tc:"):
+            _p, key, page = data.split(":")
+            if key in FEATURE_KEYS:
+                on, _ex = get_toggle(uid, key)
+                set_toggle(uid, key, 0 if on else 1)
+                show_feat_config(call, key, int(page))
+                try:
+                    bot.answer_callback_query(call.id, "🟢 روشن شد" if not on else "🔴 خاموش شد")
+                except Exception:
+                    pass
+            return
+        if data.startswith("cf:"):
+            _p, key, val, page = data.split(":")
+            if key in FEATURE_KEYS:
+                spec = FEAT_CFG.get(key, {})
+                done = False
+                if spec.get("t") == "choice" and val in dict(spec.get("choices", [])):
+                    on, _e = get_toggle(uid, key)
+                    set_toggle(uid, key, on, val)
+                    done = True
+                elif key == "name_rotate" and val in NAME_FONTS:
+                    cfg = _cfg_name(uid)
+                    cfg["font"] = val
+                    on, _e = get_toggle(uid, key)
+                    set_toggle(uid, key, on, json.dumps(cfg, ensure_ascii=False))
+                    done = True
+                if done:
+                    show_feat_config(call, key, int(page))
+                    bot.answer_callback_query(call.id, "✅ ذخیره شد")
+                    return
+            bot.answer_callback_query(call.id)
+            return
+        if data.startswith("cfs:"):
+            _p, key, page = data.split(":")
+            if key in FEATURE_KEYS:
+                set_state(uid, "feat_cfg", key=key, page=int(page))
+                spec = FEAT_CFG.get(key, {})
+                prompt = spec.get("ask") or ("✍️ مقدار جدید را بفرست:\n" + spec.get("hint", ""))
+                bot.send_message(call.message.chat.id, prompt, parse_mode="HTML")
+            bot.answer_callback_query(call.id)
+            return
+        if data.startswith("cfa:"):
+            _p, key, page = data.split(":")
+            if key in FEATURE_KEYS:
+                set_state(uid, "feat_add", key=key, page=int(page))
+                spec = FEAT_CFG.get(key, {})
+                bot.send_message(call.message.chat.id, "➕ بفرست:\n" + spec.get("hint", ""), parse_mode="HTML")
+            bot.answer_callback_query(call.id)
+            return
+        if data.startswith("cfd:"):
+            _p, key, idx, page = data.split(":")
+            if key in FEATURE_KEYS:
+                try:
+                    i = int(idx)
+                    spec = FEAT_CFG.get(key, {})
+                    if spec.get("t") == "list":
+                        items = _cfg_list(uid, key)
+                        if 0 <= i < len(items):
+                            items.pop(i)
+                            on, _e = get_toggle(uid, key)
+                            set_toggle(uid, key, on, json.dumps(items, ensure_ascii=False))
+                    elif spec.get("t") == "dict":
+                        d = _cfg_dict(uid, key)
+                        ks = list(d.keys())
+                        if 0 <= i < len(ks):
+                            d.pop(ks[i], None)
+                            on, _e = get_toggle(uid, key)
+                            set_toggle(uid, key, on, json.dumps(d, ensure_ascii=False))
+                    show_feat_config(call, key, int(page))
+                    bot.answer_callback_query(call.id, "🗑 حذف شد")
+                except Exception:
+                    bot.answer_callback_query(call.id, "⚠️ خطا!")
+            return
+        if data.startswith("cfc:"):
+            _p, key, page = data.split(":")
+            if key in FEATURE_KEYS:
+                on, _e = get_toggle(uid, key)
+                if key == "name_rotate":
+                    set_toggle(uid, key, on, json.dumps({"tpl": "{name} 🕒{time}", "font": "normal"}, ensure_ascii=False))
+                else:
+                    set_toggle(uid, key, on, "")
+                show_feat_config(call, key, int(page))
+                bot.answer_callback_query(call.id, "🧹 به پیش‌فرض برگشت")
+            return
         if data == "tb:list":
             try:
                 bot.edit_message_text(tabchi_list_text(uid), call.message.chat.id, call.message.message_id,
@@ -1465,6 +1567,379 @@ def st_tb_edit(uid, text, m):
         bot.send_message(m.chat.id, tabchi_list_text(uid), reply_markup=tabchi_list_kb(uid), parse_mode="HTML")
     except Exception:
         pass
+
+# ============================================================
+# سیستم تنظیمات تکی قابلیت‌های سلف (V1.5)
+# ============================================================
+def _font_map(upper_base, lower_base, digit_base):
+    m = {}
+    for i in range(26):
+        m[chr(65 + i)] = chr(upper_base + i)
+        m[chr(97 + i)] = chr(lower_base + i)
+    if digit_base:
+        for i in range(10):
+            m[chr(48 + i)] = chr(digit_base + i)
+    return m
+
+
+_FONT_MAPS = {
+    "bold": _font_map(0x1D400, 0x1D41A, 0x1D7CE),
+    "italic": _font_map(0x1D434, 0x1D44E, None),
+    "mono": _font_map(0x1D670, 0x1D68A, 0x1D7F6),
+    "full": _font_map(0xFF21, 0xFF41, 0xFF10),
+}
+_CIRCLE = _font_map(0x24B6, 0x24D0, None)
+_CIRCLE["0"] = chr(0x24EA)
+for _i in range(1, 10):
+    _CIRCLE[str(_i)] = chr(0x245F + _i)
+_FONT_MAPS["circle"] = _CIRCLE
+
+NAME_FONTS = {
+    "normal": "🔤 معمولی",
+    "bold": "ضخیم",
+    "italic": "کج",
+    "mono": "مونو",
+    "full": "پهن",
+    "circle": "دایره‌ای",
+}
+
+
+def apply_name_font(text, font):
+    m = _FONT_MAPS.get(font or "normal")
+    if not m:
+        return text or ""
+    return "".join(m.get(c, c) for c in (text or ""))
+
+
+def _cfg_list(uid, key):
+    try:
+        _o, ex = get_toggle(uid, key)
+        v = json.loads(ex) if (ex or "").strip().startswith("[") else []
+        return [str(i) for i in v if str(i).strip()][:50]
+    except Exception:
+        return []
+
+
+def _cfg_dict(uid, key):
+    try:
+        _o, ex = get_toggle(uid, key)
+        v = json.loads(ex) if (ex or "").strip().startswith("{") else {}
+        return {str(k): str(val) for k, val in v.items()} if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def _cfg_name(uid):
+    cfg = {"tpl": "{name} 🕒{time}", "font": "normal", "base": ""}
+    try:
+        _o, ex = get_toggle(uid, "name_rotate")
+        if (ex or "").strip().startswith("{"):
+            v = json.loads(ex)
+            if isinstance(v, dict):
+                if v.get("tpl"):
+                    cfg["tpl"] = str(v["tpl"])[:80]
+                if v.get("font") in NAME_FONTS:
+                    cfg["font"] = v["font"]
+                if v.get("base"):
+                    cfg["base"] = str(v["base"])[:40]
+    except Exception:
+        pass
+    return cfg
+
+
+def _render_name(base, cfg):
+    t = now_tehran()
+    s = cfg["tpl"].replace("{name}", base or "").replace("{time}", t.strftime("%H:%M")).replace("{date}", t.strftime("%Y/%m/%d"))
+    return apply_name_font(s[:60], cfg["font"])
+
+
+def silent_now(uid):
+    try:
+        on, ex = get_toggle(uid, "silent_hours")
+        if not on:
+            return False
+        m = re.match(r"^\s*(\d{1,2})\s*-\s*(\d{1,2})\s*$", fa_to_en(ex or "1-7"))
+        if not m:
+            return False
+        a, b = int(m.group(1)) % 24, int(m.group(2)) % 24
+        if a == b:
+            return False
+        h = now_tehran().hour
+        if a < b:
+            return a <= h < b
+        return h >= a or h < b
+    except Exception:
+        return False
+
+
+def welcome_is_seen(uid, peer):
+    try:
+        conn = get_conn()
+        r = conn.execute("SELECT 1 FROM welcome_seen WHERE user_id=? AND peer=?", (int(uid), str(peer))).fetchone()
+        conn.close()
+        return bool(r)
+    except Exception:
+        return True
+
+
+def welcome_mark(uid, peer):
+    with _db_lock:
+        try:
+            conn = get_conn()
+            conn.execute("INSERT OR IGNORE INTO welcome_seen(user_id,peer) VALUES(?,?)", (int(uid), str(peer)))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+
+_spam_hits = {}
+_spam_lock = threading.RLock()
+_mute_counts = {}
+_mute_lock = threading.RLock()
+_muted_done = set()
+_alert_throttle = {}
+
+FEAT_CFG = {
+    "auto_reply": {"t": "text", "hint": "متن دلخواهت را بفرست.\n• می‌توانی از {name} برای اسم طرف استفاده کنی.\n• فقط برای پی‌وی انسان‌هاست (نه گروه، نه ربات).\n• برای برگشت به سبک پیش‌فرض: <code>-</code>", "max": 500},
+    "bio_rotate": {"t": "list", "hint": "هر بیو را در یک پیام جدا بفرست.\n• می‌توانی از {time} و {date} استفاده کنی.\n• اگر لیست خالی باشد از بیوهای پیش‌فرض استفاده می‌شود."},
+    "name_rotate": {"t": "name", "ask": "🖋 قالب اسم را بفرست؛ مثلاً:\n<code>{name} 🕒{time}</code>\n• ‏{name} = اسم پایه، {time} = ساعت، {date} = تاریخ\n• برای پیش‌فرض: <code>-</code>\n• فونت فقط روی حروف انگلیسی اثر دارد."},
+    "profile_schedule": {"t": "number", "hint": "ساعت یادآور تغییر پروفایل (۰ تا ۲۳) — مثلاً 9", "min": 0, "max": 23, "default": "9"},
+    "account_status": {"t": "info", "info": "👻 روشن = حالت روح (پیام‌ها خوانده نمی‌شوند و طرف نمی‌فهمد آنلاین بودی).\nخاموش = حالت عادی (تیک دوم می‌خورد)."},
+    "auto_translate": {"t": "text", "hint": "کد زبان مقصد پیش‌فرض: fa / en / ar / tr / ru ...", "max": 8, "default": "fa"},
+    "voice_to_text": {"t": "info", "info": "🎙 روی ویس‌ها جواب اطلاع‌رسانی می‌دهد. (نسخه پایه)"},
+    "summarize": {"t": "number", "hint": "پیام‌های پی‌وی بلندتر از این تعداد کاراکتر خلاصه می‌شوند (۱۰۰ تا ۴۰۰۰)", "min": 100, "max": 4000, "default": "600"},
+    "categorize": {"t": "info", "info": "🏷 پیام‌ها را موضوعی برچسب می‌زند (کاری/مالی/تبلیغات/...) و در آمار روزانه می‌بینی."},
+    "save_deleted": {"t": "info", "info": "🗑 پیام‌های حذف‌شده در سیو مسج اکانتت ذخیره می‌شوند."},
+    "save_edits": {"t": "info", "info": "✏️ قبل و بعد ویرایش پیام‌ها در سیو مسج ثبت می‌شود."},
+    "backup_chats": {"t": "number", "hint": "دستور .بکاپ بدون عدد، این تعداد پیام را ذخیره می‌کند (۱۰ تا ۵۰۰)", "min": 10, "max": 500, "default": "100"},
+    "adv_search": {"t": "number", "hint": "جستجو در این تعداد پیام اخیر انجام می‌شود (۵۰ تا ۱۰۰۰)", "min": 50, "max": 1000, "default": "300"},
+    "auto_archive": {"t": "info", "info": "🗂 گروه‌های بدون پیام خوانده‌نشده و غیرسنجاق‌شده خودکار آرشیو می‌شوند."},
+    "chat_notes": {"t": "info", "info": "📌 با دستور <code>.یادداشت متن</code> داخل هر گفتگو نکته ثبت کن."},
+    "auto_pin": {"t": "text", "hint": "پیام‌هایی که این کلمه را داشته باشند سنجاق می‌شوند.", "max": 30, "default": "#مهم"},
+    "reminders": {"t": "info", "info": "⏰ با دستور <code>.یادآوری 30 متن</code> یادآور بساز."},
+    "quick_cmds": {"t": "dict", "hint": "فرمت افزودن: <code>کلید=متن پاسخ</code>\nمثلاً: <code>سلام=سلام رفیق! چطوری؟</code>\nاگر کسی در پی‌وی دقیقاً همان کلید را بفرستد، جواب خودکار می‌گیرد.\nکلیدهای آماده: سلام، ساعت، تاریخ"},
+    "multi_account": {"t": "info", "info": "👥 با روشن‌بودن این گزینه می‌توانی تا ۳ اکانت سلف داشته باشی."},
+    "reply_style": {"t": "choice", "choices": [("default", "🌙 پیش‌فرض"), ("doostane", "💜 دوستانه"), ("rasmi", "💼 رسمی"), ("fun", "😎 فان"), ("kootah", "⚡ کوتاه")]},
+    "sticker_suggest": {"t": "number", "hint": "فقط پیام‌های کوتاه‌تر از این تعداد کاراکتر پیشنهاد می‌گیرند (۲۰ تا ۵۰۰)", "min": 20, "max": 500, "default": "100"},
+    "emoji_suggest": {"t": "info", "info": "😊 به پاسخ خودکار، اموجی مناسب حال‌وهوای پیام اضافه می‌کند."},
+    "personal_cmds": {"t": "dict", "hint": "فرمت: <code>نام=متن</code> — بعد با <code>.نام</code> اجرا می‌شود."},
+    "notebook": {"t": "info", "info": "📓 با <code>.دفترچه متن</code> یادداشت کن، با <code>.دفترچه‌ها</code> ببین."},
+    "daily_report": {"t": "number", "hint": "ساعت ارسال گزارش روزانه (۰ تا ۲۳)", "min": 0, "max": 23, "default": "23"},
+    "chat_stats": {"t": "info", "info": "📈 شمارش پیام‌ها برای آمار و گزارش روزانه."},
+    "scheduled_send": {"t": "info", "info": "📤 با دستور <code>.زمانبندی 60 متن</code> داخل هر چت ارسال زمان‌دار کن."},
+    "notif_manage": {"t": "number", "hint": "گروهی که در یک ساعت بیشتر از این تعداد پیام بگیرد بی‌صدا می‌شود (۱۰ تا ۵۰۰)", "min": 10, "max": 500, "default": "30"},
+    "tabchi": {"t": "link"},
+    "smart_guard": {"t": "info", "info": "🛡 پیام‌های امنیتی 777000 (مثل ورود جدید) را برایت فوروارد می‌کند + اطلاع روشن‌شدن سلف در سیو مسج."},
+    "anti_spam": {"t": "text", "hint": "فرمت: <code>تعداد/ثانیه</code> — مثلاً <code>5/60</code> یعنی بیش از ۵ پیام در ۶۰ ثانیه = اسپم (هشدار + گزارش به تو)", "max": 12, "default": "5/60"},
+    "silent_hours": {"t": "text", "hint": "فرمت: <code>شروع-پایان</code> — مثلاً <code>1-7</code>\nدر این ساعات پاسخ خودکار، خوش‌آمد، ری‌اکشن و پیشنهادها غیرفعال‌اند.", "max": 12, "default": "1-7"},
+    "pv_welcome": {"t": "text", "hint": "به اولین پیام هر پی‌وی جدید (انسان) این را می‌فرستد. {name} = اسم طرف", "max": 400, "default": "سلام {name}! 👋 خوش اومدی ✨"},
+    "auto_react": {"t": "text", "hint": "یک اموجی بفرست (مثلاً ❤️ یا 🔥) تا به پیام‌های پی‌وی ری‌اکشن بزند.", "max": 8, "default": "❤️"},
+    "keyword_alert": {"t": "list", "hint": "هر کلمه را در یک پیام جدا بفرست. اگر در پیامی بیاید، به تو خبر می‌دهد."},
+    "typing_effect": {"t": "number", "hint": "چند ثانیه «در حال نوشتن...» نشان بدهد قبل از پاسخ (۱ تا ۵)", "min": 1, "max": 5, "default": "2"},
+}
+
+
+def cfg_current_text(uid, key):
+    spec = FEAT_CFG.get(key, {})
+    t = spec.get("t")
+    on, ex = get_toggle(uid, key)
+    ex = (ex or "").strip()
+    if t == "text":
+        if ex:
+            return f"مقدار فعلی: {esc(ex[:150])}"
+        d = spec.get("default", "")
+        return f"مقدار فعلی: پیش‌فرض ({esc(str(d)[:80])})" if d else "مقدار فعلی: پیش‌فرض"
+    if t == "number":
+        return f"مقدار فعلی: <b>{esc(ex or spec.get('default', ''))}</b>"
+    if t == "choice":
+        mp = dict(spec.get("choices", []))
+        return f"انتخاب فعلی: <b>{esc(mp.get(ex or 'default', ex or 'default'))}</b>"
+    if t == "list":
+        items = _cfg_list(uid, key)
+        if not items:
+            return "لیست خالی است (از پیش‌فرض استفاده می‌شود)."
+        s = f"آیتم‌ها ({len(items)}):\n" + "\n".join(f"• {esc(i[:60])}" for i in items[:8])
+        return s + ("\n..." if len(items) > 8 else "")
+    if t == "dict":
+        d = _cfg_dict(uid, key)
+        if not d:
+            return "خالی است."
+        ks = list(d.keys())
+        s = f"کلیدها ({len(d)}): " + "، ".join(f"<code>{esc(k)}</code>" for k in ks[:8])
+        return s + ("..." if len(d) > 8 else "")
+    if t == "name":
+        cfg = _cfg_name(uid)
+        prev = _render_name(cfg.get("base") or "اکانت من", cfg)
+        return (f"قالب فعلی: <code>{esc(cfg['tpl'])}</code>\nفونت فعلی: <b>{esc(NAME_FONTS.get(cfg['font'], cfg['font']))} {esc(apply_name_font('Abc', cfg['font']))}</b>\n"
+                f"🔤 اسم پایه: {esc(cfg.get('base') or '— (اولین چرخه ثبت می‌شود)')}\nپیش‌نمایش: {esc(prev)}")
+    if t == "info":
+        return spec.get("info", "")
+    if t == "link":
+        return "مدیریت کامل تبچی:"
+    return ""
+
+
+def feat_config_text(uid, key):
+    n, title, desc = FEATURE_BY_KEY[key]
+    on, _e = get_toggle(uid, key)
+    rows = [f"<b>{n}. {esc(title)}</b> — {'🟢 روشن' if on else '🔴 خاموش'}",
+            f"<i>{esc(desc)}</i>", "", cfg_current_text(uid, key)]
+    spec = FEAT_CFG.get(key, {})
+    if spec.get("t") in ("text", "number", "list", "dict") and spec.get("hint"):
+        rows += ["", "ℹ️ " + spec["hint"]]
+    return panel_box("⚙️ تنظیم قابلیت", rows)
+
+
+def feat_config_kb(uid, key, page):
+    spec = FEAT_CFG.get(key, {})
+    t = spec.get("t")
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    on, _e = get_toggle(uid, key)
+    kb.add(types.InlineKeyboardButton("🔴 خاموش کن" if on else "🟢 روشن کن", callback_data=f"tc:{key}:{page}"))
+    if t in ("text", "number"):
+        kb.add(types.InlineKeyboardButton("✍️ تنظیم مقدار", callback_data=f"cfs:{key}:{page}"))
+        if key in ("auto_reply", "pv_welcome"):
+            kb.add(types.InlineKeyboardButton("🧹 برگشت به پیش‌فرض", callback_data=f"cfc:{key}:{page}"))
+    elif t == "choice":
+        for val, label in spec.get("choices", []):
+            kb.add(types.InlineKeyboardButton(label, callback_data=f"cf:{key}:{val}:{page}"))
+    elif t in ("list", "dict"):
+        kb.add(types.InlineKeyboardButton("➕ افزودن", callback_data=f"cfa:{key}:{page}"))
+        if t == "list":
+            items = _cfg_list(uid, key)
+            for i, it in enumerate(items[:6]):
+                kb.add(types.InlineKeyboardButton(f"🗑 {it[:14]}", callback_data=f"cfd:{key}:{i}:{page}"))
+            if items:
+                kb.add(types.InlineKeyboardButton("🧹 پاک‌کردن همه", callback_data=f"cfc:{key}:{page}"))
+        else:
+            d = _cfg_dict(uid, key)
+            for i, k in enumerate(list(d.keys())[:6]):
+                kb.add(types.InlineKeyboardButton(f"🗑 {k[:14]}", callback_data=f"cfd:{key}:{i}:{page}"))
+    elif t == "name":
+        kb.add(types.InlineKeyboardButton("✍️ تنظیم قالب", callback_data=f"cfs:{key}:{page}"))
+        for fval, flabel in NAME_FONTS.items():
+            mark = "✅ " if _cfg_name(uid)["font"] == fval else ""
+            kb.add(types.InlineKeyboardButton(f"{mark}{flabel} {apply_name_font('Abc', fval)}", callback_data=f"cf:{key}:{fval}:{page}"))
+        kb.add(types.InlineKeyboardButton("↩️ ریست کامل", callback_data=f"cfc:{key}:{page}"))
+    elif t == "link":
+        kb.add(types.InlineKeyboardButton(gb("⚡ مدیریت تبچی"), callback_data="tb:list"))
+    kb.add(types.InlineKeyboardButton(gb("🔙 قابلیت‌ها"), callback_data=f"f:{page}"))
+    return kb
+
+
+def show_feat_config(call, key, page):
+    uid = int(call.from_user.id)
+    try:
+        bot.edit_message_text(feat_config_text(uid, key), call.message.chat.id, call.message.message_id,
+                              reply_markup=feat_config_kb(uid, key, page), parse_mode="HTML")
+    except Exception:
+        pass
+
+
+def _resend_config(uid, chat_id, key, page):
+    try:
+        bot.send_message(chat_id, feat_config_text(uid, key), reply_markup=feat_config_kb(uid, key, page), parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@register_state("feat_cfg")
+def st_feat_cfg(uid, text, m):
+    st = get_state(uid)
+    key, page = st.get("key"), int(st.get("page", 0))
+    spec = FEAT_CFG.get(key, {})
+    t = spec.get("t")
+    text = fa_to_en(text or "").strip()
+    if key == "name_rotate":
+        cfg = _cfg_name(uid)
+        cfg["tpl"] = "{name} 🕒{time}" if text == "-" else text[:80]
+        on, _e = get_toggle(uid, key)
+        set_toggle(uid, key, on, json.dumps(cfg, ensure_ascii=False))
+        clear_state(uid)
+        bot.send_message(m.chat.id, f"✅ قالب ذخیره شد! پیش‌نمایش: {esc(_render_name(cfg.get('base') or 'اکانت من', cfg))}", parse_mode="HTML")
+        _resend_config(uid, m.chat.id, key, page)
+        return
+    if t == "text":
+        if text == "-":
+            val = ""
+        else:
+            val = text[:int(spec.get("max", 500))]
+            if key == "silent_hours":
+                if not re.match(r"^\d{1,2}-\d{1,2}$", val):
+                    bot.send_message(m.chat.id, "⚠️ فرمت درست: <code>1-7</code>", parse_mode="HTML")
+                    return
+                a, b = [int(x) for x in val.split("-")]
+                if not (0 <= a <= 23 and 0 <= b <= 23):
+                    bot.send_message(m.chat.id, "⚠️ ساعت باید ۰ تا ۲۳ باشد!")
+                    return
+                val = f"{a}-{b}"
+            if key == "anti_spam":
+                if not re.match(r"^\d{1,3}/\d{1,4}$", val):
+                    bot.send_message(m.chat.id, "⚠️ فرمت درست: <code>5/60</code>", parse_mode="HTML")
+                    return
+        on, _e = get_toggle(uid, key)
+        set_toggle(uid, key, on, val)
+        clear_state(uid)
+        bot.send_message(m.chat.id, "✅ ذخیره شد!")
+        _resend_config(uid, m.chat.id, key, page)
+        return
+    if t == "number":
+        try:
+            v = int(text)
+        except Exception:
+            bot.send_message(m.chat.id, "⚠️ فقط عدد بفرست!")
+            return
+        if not (int(spec.get("min", 0)) <= v <= int(spec.get("max", 9999))):
+            bot.send_message(m.chat.id, f"⚠️ عدد باید بین {spec.get('min')} تا {spec.get('max')} باشد!")
+            return
+        on, _e = get_toggle(uid, key)
+        set_toggle(uid, key, on, str(v))
+        clear_state(uid)
+        bot.send_message(m.chat.id, "✅ ذخیره شد!")
+        _resend_config(uid, m.chat.id, key, page)
+        return
+    clear_state(uid)
+    bot.send_message(m.chat.id, "⚠️ خطا!", reply_markup=main_menu_kb(uid))
+
+
+@register_state("feat_add")
+def st_feat_add(uid, text, m):
+    st = get_state(uid)
+    key, page = st.get("key"), int(st.get("page", 0))
+    spec = FEAT_CFG.get(key, {})
+    text = (text or "").strip()
+    if spec.get("t") == "list":
+        if not text:
+            bot.send_message(m.chat.id, "⚠️ متن خالی!")
+            return
+        items = _cfg_list(uid, key)
+        items.append(text[:200])
+        on, _e = get_toggle(uid, key)
+        set_toggle(uid, key, on, json.dumps(items[:50], ensure_ascii=False))
+        clear_state(uid)
+        bot.send_message(m.chat.id, "✅ اضافه شد!")
+        _resend_config(uid, m.chat.id, key, page)
+        return
+    if spec.get("t") == "dict":
+        if "=" not in text:
+            bot.send_message(m.chat.id, "⚠️ فرمت: <code>کلید=متن</code>", parse_mode="HTML")
+            return
+        k, v = text.split("=", 1)
+        k, v = k.strip()[:40], v.strip()[:500]
+        if not k or not v:
+            bot.send_message(m.chat.id, "⚠️ کلید و متن خالی نباشد!")
+            return
+        d = _cfg_dict(uid, key)
+        d[k] = v
+        on, _e = get_toggle(uid, key)
+        set_toggle(uid, key, on, json.dumps(d, ensure_ascii=False))
+        clear_state(uid)
+        bot.send_message(m.chat.id, f"✅ «{esc(k)}» ذخیره شد!", parse_mode="HTML")
+        _resend_config(uid, m.chat.id, key, page)
+        return
+    clear_state(uid)
+
 
 # ============================================================
 # بخش سوم: تبچی (مدل)، پنل ادمین، سفارش‌ها، انتقال گروهی
@@ -2230,6 +2705,7 @@ def ensure_extra_tables():
         try:
             conn = get_conn()
             conn.execute("CREATE TABLE IF NOT EXISTS banner_data(gid INTEGER PRIMARY KEY, data BLOB, ext TEXT DEFAULT 'jpg')")
+            conn.execute("CREATE TABLE IF NOT EXISTS welcome_seen(user_id INTEGER, peer TEXT, PRIMARY KEY(user_id, peer))")
             conn.commit()
             conn.close()
         except Exception:
@@ -2906,38 +3382,193 @@ def run_self_client(acc_id):
                 except Exception:
                     pass
                 bump_activity(uid, "in")
-                if event.is_private:
+                is_pv = bool(event.is_private)
+                if is_pv:
                     bump_activity(uid, "pv")
-                on_reply, ex = get_toggle(uid, "auto_reply")
-                style, _e2 = get_toggle(uid, "reply_style")
-                style_name = (_e2 or "default").strip() or "default"
-                if on_reply and event.is_private and txt and not (event.via_bot_id or event.forward):
-                    base = AUTO_REPLY_TEXTS.get(style_name, AUTO_REPLY_TEXTS["default"])
+                sender_is_bot = False
+                sender_name = ""
+                try:
+                    sender = await event.get_sender()
+                    sender_is_bot = bool(getattr(sender, "bot", False))
+                    sender_name = getattr(sender, "first_name", "") or ""
+                except Exception:
+                    pass
+                is_fw = bool(event.forward)
+                silent = silent_now(uid)
+                replied = False
+
+                async def _typing():
+                    try:
+                        on_ty, ex_ty = get_toggle(uid, "typing_effect")
+                        if on_ty:
+                            try:
+                                dly = max(1, min(5, int((ex_ty or "2").strip())))
+                            except Exception:
+                                dly = 2
+                            async with client.action(event.chat_id, "typing"):
+                                await asyncio.sleep(dly)
+                    except Exception:
+                        pass
+
+                on_w, ex_w = get_toggle(uid, "pv_welcome")
+                if on_w and is_pv and not sender_is_bot and not silent:
+                    peer = str(event.sender_id or event.chat_id)
+                    if not welcome_is_seen(uid, peer):
+                        welcome_mark(uid, peer)
+                        wt = ((ex_w or "").strip() or "سلام {name}! 👋 خوش اومدی ✨").replace("{name}", sender_name or "عزیز")
+                        await _typing()
+                        try:
+                            await event.reply(wt[:800])
+                            bump_activity(uid, "welcome")
+                        except Exception:
+                            pass
+                on_q, _e = get_toggle(uid, "quick_cmds")
+                if on_q and txt and is_pv and not sender_is_bot and not silent:
+                    qkey = txt.strip()
+                    qd = _cfg_dict(uid, "quick_cmds")
+                    ans = qd.get(qkey)
+                    if ans is None:
+                        t = now_tehran()
+                        ans = {"سلام": f"سلام {sender_name or 'عزیز'}! 👋",
+                               "ساعت": f"🕒 ساعت {t.strftime('%H:%M')}",
+                               "تاریخ": f"📅 {t.strftime('%Y/%m/%d')}"}.get(qkey)
+                    if ans:
+                        await _typing()
+                        try:
+                            await event.reply(str(ans)[:800])
+                            bump_activity(uid, "quick")
+                            replied = True
+                        except Exception:
+                            pass
+                on_reply, ex_r = get_toggle(uid, "auto_reply")
+                if on_reply and is_pv and txt and not sender_is_bot and not is_fw and not silent and not replied:
+                    custom = (ex_r or "").strip()
+                    if custom:
+                        base = custom.replace("{name}", sender_name or "عزیز")
+                    else:
+                        _st, style_ex = get_toggle(uid, "reply_style")
+                        style_name = (style_ex or "default").strip() or "default"
+                        base = AUTO_REPLY_TEXTS.get(style_name, AUTO_REPLY_TEXTS["default"])
                     on_em, _e = get_toggle(uid, "emoji_suggest")
                     if on_em:
                         base += f" {emoji_for(txt)}"
-                    await event.reply(base)
+                    await _typing()
+                    await event.reply(base[:1000])
                     bump_activity(uid, "autoreply")
+                    replied = True
+                on_re, ex_re = get_toggle(uid, "auto_react")
+                if on_re and is_pv and txt and not sender_is_bot and not silent:
+                    try:
+                        await client.send_reaction(event.chat_id, event.id, (ex_re or "❤️").strip() or "❤️")
+                    except Exception:
+                        pass
                 on_v, _e = get_toggle(uid, "voice_to_text")
                 if on_v and (event.voice or event.audio):
                     d = getattr(event.voice, "duration", "?") if event.voice else "?"
                     await event.reply(f"🎙 <b>ویس دریافت شد</b> ({d} ثانیه)\n<i>متن خودکار (نسخه پایه):</i> «پیام صوتی — برای متن کامل، فایل را نگه دار»",
                                       parse_mode="HTML")
-                on_s, _e = get_toggle(uid, "summarize")
-                if on_s and txt and len(txt) > 600 and event.is_private:
+                on_s, ex_s = get_toggle(uid, "summarize")
+                try:
+                    minlen = int((ex_s or "600").strip())
+                except Exception:
+                    minlen = 600
+                if on_s and txt and len(txt) > minlen and is_pv and not silent and not sender_is_bot:
                     await event.reply(summarize_text(txt), parse_mode="HTML")
                 on_c, _e = get_toggle(uid, "categorize")
                 if on_c and txt:
                     bump_activity(uid, "cat:" + cat_for(txt))
-                on_p, _e = get_toggle(uid, "auto_pin")
-                if on_p and txt and "#مهم" in txt:
+                on_p, ex_p = get_toggle(uid, "auto_pin")
+                trigger = (ex_p or "").strip() or "#مهم"
+                if on_p and txt and trigger in txt:
                     try:
                         await client.pin_message(event.chat_id, event.message)
                     except Exception:
                         pass
-                on_st, _e = get_toggle(uid, "sticker_suggest")
-                if on_st and txt and event.is_private and len(txt) < 100:
+                on_st, ex_st = get_toggle(uid, "sticker_suggest")
+                try:
+                    maxlen = int((ex_st or "100").strip())
+                except Exception:
+                    maxlen = 100
+                if on_st and txt and is_pv and len(txt) < maxlen and not silent and not sender_is_bot:
                     await event.reply(f"✨ استیکر پیشنهادی: {emoji_for(txt)}  (جستجو: {esc(txt[:20])})", parse_mode="HTML")
+                on_as, ex_as = get_toggle(uid, "anti_spam")
+                if on_as and is_pv and not sender_is_bot and event.sender_id:
+                    try:
+                        mth = re.match(r"^\s*(\d{1,3})\s*/\s*(\d{1,4})\s*$", fa_to_en(ex_as or "5/60"))
+                        N = int(mth.group(1)) if mth else 5
+                        W = int(mth.group(2)) if mth else 60
+                    except Exception:
+                        N, W = 5, 60
+                    now_ts = time.time()
+                    sk = (uid, str(event.chat_id))
+                    with _spam_lock:
+                        dq = _spam_hits.setdefault(sk, [])
+                        dq[:] = [t for t in dq if now_ts - t < W]
+                        dq.append(now_ts)
+                        over = len(dq) > N
+                        last_warn = _spam_hits.get((sk, "warn"), 0)
+                        if over and now_ts - last_warn > 600:
+                            _spam_hits[(sk, "warn")] = now_ts
+                        else:
+                            over = False
+                    if over:
+                        try:
+                            await event.reply("🚫 لطفاً اسپم نکن! پیام‌هات یکی‌یکی جواب داده می‌شه. 🙏")
+                        except Exception:
+                            pass
+                        try:
+                            bot.send_message(uid, f"🚫 <b>هشدار اسپم!</b>\n👤 {esc(sender_name)} (<code>{event.sender_id}</code>)\n⚡ بیش از {N} پیام در {W} ثانیه!",
+                                             parse_mode="HTML")
+                        except Exception:
+                            pass
+                        bump_activity(uid, "antispam")
+                on_kw, _e = get_toggle(uid, "keyword_alert")
+                if on_kw and txt:
+                    words = _cfg_list(uid, "keyword_alert")
+                    hit = next((w for w in words if w and w in txt), None)
+                    if hit:
+                        kk = (uid, str(event.chat_id))
+                        now_ts = time.time()
+                        if now_ts - _alert_throttle.get(kk, 0) > 120:
+                            _alert_throttle[kk] = now_ts
+                            try:
+                                bot.send_message(uid, f"🔔 <b>کلمه کلیدی:</b> {esc(hit)}\n👤 {esc(sender_name)} | 💬 {esc(txt[:200])}", parse_mode="HTML")
+                            except Exception:
+                                pass
+                on_nm2, ex_nm = get_toggle(uid, "notif_manage")
+                if on_nm2 and not is_pv:
+                    try:
+                        TH = int((ex_nm or "30").strip())
+                    except Exception:
+                        TH = 30
+                    now_ts = time.time()
+                    mk = (uid, str(event.chat_id))
+                    with _mute_lock:
+                        dq = _mute_counts.setdefault(mk, [])
+                        dq[:] = [t for t in dq if now_ts - t < 3600]
+                        dq.append(now_ts)
+                        noisy = len(dq) > TH and mk not in _muted_done
+                        if noisy:
+                            _muted_done.add(mk)
+                    if noisy:
+                        try:
+                            from telethon.tl.functions.account import UpdateNotifySettingsRequest
+                            from telethon.tl.types import InputNotifyPeer, PeerNotifySettings
+                            peer = await client.get_input_entity(event.chat_id)
+                            await client(UpdateNotifySettingsRequest(
+                                peer=InputNotifyPeer(peer),
+                                settings=PeerNotifySettings(mute_until=2147483647, show_previews=False)))
+                            await client.send_message("me", f"🔕 گروه {esc(str(event.chat_id))} به‌خاطر شلوغی بی‌صدا شد.")
+                            bump_activity(uid, "muted")
+                        except Exception:
+                            pass
+                on_g, _e = get_toggle(uid, "smart_guard")
+                if on_g and (event.sender_id == 777000):
+                    try:
+                        snippet = (txt or "[سرویس]")[:300]
+                        bot.send_message(uid, f"🛡 <b>هشدار نگهبان!</b>\nپیام امنیتی تلگرام:\n{esc(snippet)}", parse_mode="HTML")
+                    except Exception:
+                        pass
                 ghost, _e = get_toggle(uid, "account_status")
                 if not ghost:
                     try:
@@ -3049,6 +3680,9 @@ SELF_HELP = """🌙 <b>راهنمای سلف دارک</b> ⚡
 <code>فاصله 5</code> — مکث ۵ ثانیه‌ای
 <code>تبچی روشن / تبچی خاموش</code>
 <code>تبچی</code> — لیست | <code>حذف چت</code> — حذف
+<code>.کلمه فوری</code> — افزودن کلمه هشدار | <code>.کلمات</code> — لیست
+<code>.خوشامد سلام!</code> — متن خوش‌آمد پی‌وی
+<code>.ری‌اکشن ❤️</code> — اموجی ری‌اکشن خودکار
 """
 
 
@@ -3152,7 +3786,12 @@ async def handle_self_command(client, acc_id, uid, event, cmd):
             await say("⚠️ کلمه را بنویس!")
             return
         try:
-            msgs = await client.get_messages(event.chat_id, limit=300, search=q)
+            try:
+                _o_s, _ex_s = get_toggle(uid, "adv_search")
+                _lim = max(50, min(1000, int((_ex_s or "300").strip())))
+            except Exception:
+                _lim = 300
+            msgs = await client.get_messages(event.chat_id, limit=_lim, search=q)
             L = [f"🔍 <b>{len(msgs)} نتیجه برای «{esc(q)}»:</b>", ""]
             for m_ in msgs[:10]:
                 t = (m_.raw_text or "")[:80].replace("\n", " ")
@@ -3162,11 +3801,15 @@ async def handle_self_command(client, acc_id, uid, event, cmd):
             await say("⚠️ جستجو ناموفق بود!")
         return
     if low.startswith("بکاپ"):
-        n = 100
+        try:
+            _o_b, _ex_b = get_toggle(uid, "backup_chats")
+            n = max(10, min(500, int(fa_to_en(_ex_b or "100").strip())))
+        except Exception:
+            n = 100
         try:
             p = low.split()
             if len(p) > 1:
-                n = max(10, min(500, int(p[1])))
+                n = max(10, min(500, int(fa_to_en(p[1]))))
         except Exception:
             pass
         try:
@@ -3444,6 +4087,33 @@ async def handle_self_command(client, acc_id, uid, event, cmd):
             conn.close()
         await say(f"⚡ تبچی #{g['id']} {'🟢 روشن' if low == 'تبچی روشن' else '🔴 خاموش'} شد.")
         return
+    if low.startswith("کلمه "):
+        w = low[5:].strip()[:60]
+        if not w:
+            await say("⚠️ کلمه را بنویس!")
+            return
+        items = _cfg_list(uid, "keyword_alert")
+        if w not in items:
+            items.append(w)
+            _o, _e = get_toggle(uid, "keyword_alert")
+            set_toggle(uid, "keyword_alert", _o, json.dumps(items[:50], ensure_ascii=False))
+        await say(f"🔔 «{esc(w)}» به لیست هشدار اضافه شد.")
+        return
+    if low == "کلمات":
+        items = _cfg_list(uid, "keyword_alert")
+        await say("🔔 <b>کلمات کلیدی:</b>\n" + ("\n".join(f"• {esc(i)}" for i in items) if items else "خالی است."))
+        return
+    if low.startswith("خوشامد "):
+        _o, _e = get_toggle(uid, "pv_welcome")
+        set_toggle(uid, "pv_welcome", _o, low[6:].strip()[:400])
+        await say("👋 متن خوش‌آمد ذخیره شد ✅")
+        return
+    if low.startswith("ری‌اکشن ") or low.startswith("ریاکشن "):
+        em = (low.split(" ", 1)[1].strip()[:8] if " " in low else "") or "❤️"
+        _o, _e = get_toggle(uid, "auto_react")
+        set_toggle(uid, "auto_react", _o, em)
+        await say(f"❤️ ری‌اکشن شد: {esc(em)}")
+        return
     await say("❓ دستور نامعتبر! <code>.راهنما</code> را ببین.")
 
 
@@ -3556,8 +4226,9 @@ def bio_name_loop():
                     on_b, _e = get_toggle(uid, "bio_rotate")
                     if on_b:
                         t = now_tehran()
-                        bio = BIO_ROTATE_LIST[n % len(BIO_ROTATE_LIST)].format(
-                            time=t.strftime("%H:%M"), date=t.strftime("%Y/%m/%d"))
+                        bios = _cfg_list(uid, "bio_rotate") or BIO_ROTATE_LIST
+                        raw = bios[n % len(bios)]
+                        bio = raw.replace("{time}", t.strftime("%H:%M")).replace("{date}", t.strftime("%Y/%m/%d"))
                         try:
                             xcall(client, "__call__", UpdateProfileRequest(about=bio[:70]))
                         except Exception:
@@ -3565,14 +4236,23 @@ def bio_name_loop():
                     on_nm, _e = get_toggle(uid, "name_rotate")
                     if on_nm and n % 6 == 0:
                         try:
-                            me = xcall(client, "get_me")
-                            base = (getattr(me, "first_name", "") or "🌙").split("🕒")[0].strip()[:40]
-                            xcall(client, "__call__", UpdateProfileRequest(
-                                first_name=f"{base} 🕒{now_tehran().strftime('%H:%M')}"))
+                            cfg = _cfg_name(uid)
+                            base0 = (cfg.get("base") or "").strip()
+                            if not base0:
+                                me = xcall(client, "get_me")
+                                base0 = (getattr(me, "first_name", "") or "🌙").split("🕒")[0].strip()[:40] or "🌙"
+                                cfg["base"] = base0
+                                set_toggle(uid, "name_rotate", on_nm, json.dumps(cfg, ensure_ascii=False))
+                            new_name = _render_name(base0, cfg)
+                            xcall(client, "__call__", UpdateProfileRequest(first_name=new_name[:64]))
                         except Exception:
                             pass
-                    on_pf, _e = get_toggle(uid, "profile_schedule")
-                    if on_pf and now_tehran().hour == 9 and n % 6 == 1:
+                    on_pf, ex_pf = get_toggle(uid, "profile_schedule")
+                    try:
+                        pf_hour = int((ex_pf or "9").strip())
+                    except Exception:
+                        pf_hour = 9
+                    if on_pf and now_tehran().hour == pf_hour and n % 6 == 1:
                         try:
                             xcall(client, "send_message", "me", "⏰ یادآور سلف دارک: وقت تغییر عکس پروفایل! (ریپلای عکس + <code>.پروفایل</code>)")
                         except Exception:
@@ -3685,7 +4365,12 @@ def daily_loop():
                     key = f"daily_{uid}_{day}"
                     if get_setting(key, ""):
                         continue
-                    if now_tehran().hour < 23:
+                    try:
+                        _o_dr, _ex_dr = get_toggle(uid, "daily_report")
+                        dr_hour = int((_ex_dr or "23").strip())
+                    except Exception:
+                        dr_hour = 23
+                    if now_tehran().hour < dr_hour:
                         continue
                     conn = get_conn()
                     rows = conn.execute("SELECT kind,COALESCE(SUM(count),0) s FROM activity_log WHERE user_id=? AND day=? GROUP BY kind",
