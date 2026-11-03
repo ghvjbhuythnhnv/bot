@@ -26,7 +26,7 @@ try:
     # معماری چندتردی ما (run_coroutine_threadsafe) ناسازگار است.
     from telethon import TelegramClient, events
     from telethon.sessions import StringSession
-    from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
+    from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, FloodWaitError
     from telethon.tl.functions.account import UpdateProfileRequest
     TELETHON_OK = True
 except Exception as _e:
@@ -39,6 +39,7 @@ except Exception as _e:
         pass
     SessionPasswordNeededError = _TelethonMissing
     PhoneCodeInvalidError = _TelethonMissing
+    FloodWaitError = _TelethonMissing
     UpdateProfileRequest = None
     print("[SELF-DARK] Telethon import failed:", _e, flush=True)
 
@@ -51,7 +52,7 @@ except Exception:
 # ============================================================
 # تنظیمات اصلی (با مقادیر پیش‌فرض داخل کد؛ بدون نیاز به Env)
 # ============================================================
-BOT_VERSION = "SELF-DARK-V1.5"
+BOT_VERSION = "SELF-DARK-V1.6"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8315326974:AAGnH1KEiDKw93u-JBV23OrPOe_jQYpTwXw").strip()
 try:
     ADMIN_ID = int(os.environ.get("ADMIN_ID", "8248647747"))
@@ -116,6 +117,7 @@ FEATURES = [
     ("auto_react", 34, "ری‌اکشن خودکار", "ری‌اکشن خودکار به پیام‌های پی‌وی"),
     ("keyword_alert", 35, "هشدار کلمه کلیدی", "خبررسانی به مالک با دیدن کلمات خاص"),
     ("typing_effect", 36, "افکت تایپینگ", "نمایش «در حال نوشتن...» قبل از پاسخ"),
+    ("live_clock", 37, "ساعت زنده نام خانوادگی", "ساعت دقیق هر دقیقه در لست‌نیم"),
 ]
 FEATURE_KEYS = {k for k, _, _, _ in FEATURES}
 FEATURE_BY_KEY = {k: (n, t, d) for k, n, t, d in FEATURES}
@@ -1379,6 +1381,12 @@ def all_callbacks(call):
                     on, _e = get_toggle(uid, key)
                     set_toggle(uid, key, on, json.dumps(cfg, ensure_ascii=False))
                     done = True
+                elif key == "live_clock" and val in NAME_FONTS:
+                    cfg = _cfg_clock(uid)
+                    cfg["font"] = val
+                    on, _e = get_toggle(uid, key)
+                    set_toggle(uid, key, on, json.dumps(cfg, ensure_ascii=False))
+                    done = True
                 if done:
                     show_feat_config(call, key, int(page))
                     bot.answer_callback_query(call.id, "✅ ذخیره شد")
@@ -1432,10 +1440,31 @@ def all_callbacks(call):
                 on, _e = get_toggle(uid, key)
                 if key == "name_rotate":
                     set_toggle(uid, key, on, json.dumps({"tpl": "{name} 🕒{time}", "font": "normal"}, ensure_ascii=False))
+                elif key == "live_clock":
+                    set_toggle(uid, key, on, json.dumps({"fmt": "🕒 {time}", "font": "normal"}, ensure_ascii=False))
                 else:
                     set_toggle(uid, key, on, "")
                 show_feat_config(call, key, int(page))
                 bot.answer_callback_query(call.id, "🧹 به پیش‌فرض برگشت")
+            return
+        if data.startswith("cfgo:"):
+            _p, key, page = data.split(":")
+            if key in ("name_rotate", "bio_rotate", "live_clock", "profile_schedule"):
+                accs = [a for a in get_self_accounts(uid) if int(a.get("is_on", 0) or 0)]
+                if not accs:
+                    bot.answer_callback_query(call.id, "⚠️ سلف روشنی نداری!", show_alert=True)
+                    return
+                with self_clients_lock:
+                    info = self_clients.get(int(accs[0]["id"]))
+                if not info:
+                    bot.answer_callback_query(call.id, "⚠️ سلف آنلاین نیست! کمی صبر کن.", show_alert=True)
+                    return
+                try:
+                    res = run_profile_cycle(int(accs[0]["id"]), uid, info["client"], 10, force_key=key)
+                    bot.answer_callback_query(call.id, "⚡ اجرا شد!")
+                    bot.send_message(call.message.chat.id, "⚡ <b>نتیجه اجرای فوری:</b>\n" + "\n".join(res[:10]), parse_mode="HTML")
+                except Exception as e:
+                    bot.answer_callback_query(call.id, f"⚠️ {str(e)[:80]}", show_alert=True)
             return
         if data == "tb:list":
             try:
@@ -1653,6 +1682,38 @@ def _render_name(base, cfg):
     return apply_name_font(s[:60], cfg["font"])
 
 
+def _cfg_clock(uid):
+    cfg = {"fmt": "🕒 {time}", "font": "normal"}
+    try:
+        _o, ex = get_toggle(uid, "live_clock")
+        if (ex or "").strip().startswith("{"):
+            v = json.loads(ex)
+            if isinstance(v, dict):
+                if v.get("fmt"):
+                    cfg["fmt"] = str(v["fmt"])[:60]
+                if v.get("font") in NAME_FONTS:
+                    cfg["font"] = v["font"]
+    except Exception:
+        pass
+    return cfg
+
+
+def _render_clock(cfg):
+    t = now_tehran()
+    s = cfg["fmt"].replace("{time}", t.strftime("%H:%M")).replace("{sec}", t.strftime("%S")).replace("{date}", t.strftime("%Y/%m/%d"))
+    return apply_name_font(s[:60], cfg["font"])
+
+
+def resolve_chat(v):
+    try:
+        s = str(v).strip()
+        if re.match(r"^-?\d+$", s):
+            return int(s)
+    except Exception:
+        pass
+    return v
+
+
 def silent_now(uid):
     try:
         on, ex = get_toggle(uid, "silent_hours")
@@ -1699,6 +1760,7 @@ _mute_counts = {}
 _mute_lock = threading.RLock()
 _muted_done = set()
 _alert_throttle = {}
+_tabchi_backoff = {}
 
 FEAT_CFG = {
     "auto_reply": {"t": "text", "hint": "متن دلخواهت را بفرست.\n• می‌توانی از {name} برای اسم طرف استفاده کنی.\n• فقط برای پی‌وی انسان‌هاست (نه گروه، نه ربات).\n• برای برگشت به سبک پیش‌فرض: <code>-</code>", "max": 500},
@@ -1737,6 +1799,7 @@ FEAT_CFG = {
     "auto_react": {"t": "text", "hint": "یک اموجی بفرست (مثلاً ❤️ یا 🔥) تا به پیام‌های پی‌وی ری‌اکشن بزند.", "max": 8, "default": "❤️"},
     "keyword_alert": {"t": "list", "hint": "هر کلمه را در یک پیام جدا بفرست. اگر در پیامی بیاید، به تو خبر می‌دهد."},
     "typing_effect": {"t": "number", "hint": "چند ثانیه «در حال نوشتن...» نشان بدهد قبل از پاسخ (۱ تا ۵)", "min": 1, "max": 5, "default": "2"},
+    "live_clock": {"t": "clock", "ask": "🕒 قالب ساعت نام خانوادگی را بفرست؛ مثلاً:\n<code>🕒 {time}</code>\n• ‏{time} = ساعت و دقیقه، {sec} = ثانیه، {date} = تاریخ\n• هر ۱ دقیقه خودکار به‌روز می‌شود.\n• برای پیش‌فرض: <code>-</code>", "default": "🕒 {time}"},
 }
 
 
@@ -1773,6 +1836,10 @@ def cfg_current_text(uid, key):
         prev = _render_name(cfg.get("base") or "اکانت من", cfg)
         return (f"قالب فعلی: <code>{esc(cfg['tpl'])}</code>\nفونت فعلی: <b>{esc(NAME_FONTS.get(cfg['font'], cfg['font']))} {esc(apply_name_font('Abc', cfg['font']))}</b>\n"
                 f"🔤 اسم پایه: {esc(cfg.get('base') or '— (اولین چرخه ثبت می‌شود)')}\nپیش‌نمایش: {esc(prev)}")
+    if t == "clock":
+        cfg = _cfg_clock(uid)
+        return (f"قالب فعلی: <code>{esc(cfg['fmt'])}</code>\nفونت فعلی: <b>{esc(NAME_FONTS.get(cfg['font'], cfg['font']))} {esc(apply_name_font('12:34', cfg['font']))}</b>\n"
+                f"⏱ هر ۱ دقیقه در <b>نام خانوادگی</b> به‌روز می‌شود.\nپیش‌نمایش: {esc(_render_clock(cfg))}")
     if t == "info":
         return spec.get("info", "")
     if t == "link":
@@ -1797,6 +1864,8 @@ def feat_config_kb(uid, key, page):
     kb = types.InlineKeyboardMarkup(row_width=2)
     on, _e = get_toggle(uid, key)
     kb.add(types.InlineKeyboardButton("🔴 خاموش کن" if on else "🟢 روشن کن", callback_data=f"tc:{key}:{page}"))
+    if key in ("name_rotate", "bio_rotate", "live_clock", "profile_schedule"):
+        kb.add(types.InlineKeyboardButton("⚡ اجرای فوری", callback_data=f"cfgo:{key}:{page}"))
     if t in ("text", "number"):
         kb.add(types.InlineKeyboardButton("✍️ تنظیم مقدار", callback_data=f"cfs:{key}:{page}"))
         if key in ("auto_reply", "pv_welcome"):
@@ -1821,6 +1890,12 @@ def feat_config_kb(uid, key, page):
         for fval, flabel in NAME_FONTS.items():
             mark = "✅ " if _cfg_name(uid)["font"] == fval else ""
             kb.add(types.InlineKeyboardButton(f"{mark}{flabel} {apply_name_font('Abc', fval)}", callback_data=f"cf:{key}:{fval}:{page}"))
+        kb.add(types.InlineKeyboardButton("↩️ ریست کامل", callback_data=f"cfc:{key}:{page}"))
+    elif t == "clock":
+        kb.add(types.InlineKeyboardButton("✍️ تنظیم قالب", callback_data=f"cfs:{key}:{page}"))
+        for fval, flabel in NAME_FONTS.items():
+            mark = "✅ " if _cfg_clock(uid)["font"] == fval else ""
+            kb.add(types.InlineKeyboardButton(f"{mark}{flabel} {apply_name_font('12:34', fval)}", callback_data=f"cf:{key}:{fval}:{page}"))
         kb.add(types.InlineKeyboardButton("↩️ ریست کامل", callback_data=f"cfc:{key}:{page}"))
     elif t == "link":
         kb.add(types.InlineKeyboardButton(gb("⚡ مدیریت تبچی"), callback_data="tb:list"))
@@ -1858,6 +1933,15 @@ def st_feat_cfg(uid, text, m):
         set_toggle(uid, key, on, json.dumps(cfg, ensure_ascii=False))
         clear_state(uid)
         bot.send_message(m.chat.id, f"✅ قالب ذخیره شد! پیش‌نمایش: {esc(_render_name(cfg.get('base') or 'اکانت من', cfg))}", parse_mode="HTML")
+        _resend_config(uid, m.chat.id, key, page)
+        return
+    if key == "live_clock":
+        cfg = _cfg_clock(uid)
+        cfg["fmt"] = "🕒 {time}" if text == "-" else text[:60]
+        on, _e = get_toggle(uid, key)
+        set_toggle(uid, key, on, json.dumps(cfg, ensure_ascii=False))
+        clear_state(uid)
+        bot.send_message(m.chat.id, f"✅ ذخیره شد! پیش‌نمایش: {esc(_render_clock(cfg))}", parse_mode="HTML")
         _resend_config(uid, m.chat.id, key, page)
         return
     if t == "text":
@@ -3637,6 +3721,12 @@ def run_self_client(acc_id):
                 log("self-out err", traceback.format_exc()[-300:])
 
         log("self client started", acc_id, "uid", uid)
+        try:
+            _on_g, _e_g = get_toggle(uid, "smart_guard")
+            if _on_g:
+                loop.run_until_complete(client.send_message("me", f"🟢 <b>سلف دارک روشن شد!</b>\n⏰ {now_str()}\nقابلیت‌ها از ربات مدیریت می‌شوند. ⚙️", parse_mode="HTML"))
+        except Exception:
+            pass
         loop.run_until_complete(client.run_until_disconnected())
     except Exception as e:
         log("self client", acc_id, "died:", repr(e)[:250])
@@ -3682,6 +3772,7 @@ SELF_HELP = """🌙 <b>راهنمای سلف دارک</b> ⚡
 <code>تبچی</code> — لیست | <code>حذف چت</code> — حذف
 <code>.کلمه فوری</code> — افزودن کلمه هشدار | <code>.کلمات</code> — لیست
 <code>.خوشامد سلام!</code> — متن خوش‌آمد پی‌وی
+<code>.تست پروفایل</code> — اجرای فوری نام/ساعت/بیو
 <code>.ری‌اکشن ❤️</code> — اموجی ری‌اکشن خودکار
 """
 
@@ -4114,6 +4205,14 @@ async def handle_self_command(client, acc_id, uid, event, cmd):
         set_toggle(uid, "auto_react", _o, em)
         await say(f"❤️ ری‌اکشن شد: {esc(em)}")
         return
+    if low in ("تست پروفایل", "تست"):
+        try:
+            loop = asyncio.get_running_loop()
+            res = await loop.run_in_executor(None, lambda: run_profile_cycle(acc_id, uid, client, 10))
+            await say("⚡ <b>نتیجه تست پروفایل:</b>\n" + "\n".join(res[:12]))
+        except Exception as e:
+            await say(f"⚠️ خطا: {esc(str(e)[:200])}")
+        return
     await say("❓ دستور نامعتبر! <code>.راهنما</code> را ببین.")
 
 
@@ -4173,6 +4272,9 @@ def tabchi_loop():
             conn.close()
             for r in rows:
                 r = dict(r)
+                gid = r["id"]
+                if time.time() < _tabchi_backoff.get(gid, 0):
+                    continue
                 try:
                     on_tb, _e = get_toggle(r["user_id"], "tabchi")
                     if not on_tb:
@@ -4181,7 +4283,7 @@ def tabchi_loop():
                     mins = int(r.get("interval_min", 30) or 30)
                     if last and (now_tehran().replace(tzinfo=None) - last).total_seconds() < mins * 60:
                         continue
-                    if not (r.get("text") or "") and not load_banner(r["id"]):
+                    if not (r.get("text") or "") and not load_banner(gid):
                         continue
                     with self_clients_lock:
                         info = self_clients.get(int(r.get("account_id") or 0))
@@ -4193,17 +4295,25 @@ def tabchi_loop():
                     if not info:
                         continue
                     client = info["client"]
-                    b = load_banner(r["id"])
-                    if b:
-                        xcall(client, "send_file", str(r["chat_id"]), io.BytesIO(b[0]), caption=(r.get("text") or "")[:1000] or None)
-                    else:
-                        xcall(client, "send_message", str(r["chat_id"]), r.get("text") or "")
+                    chat = resolve_chat(r["chat_id"])
+                    b = load_banner(gid)
+                    try:
+                        if b:
+                            xcall(client, "send_file", chat, io.BytesIO(b[0]), caption=(r.get("text") or "")[:1000] or None)
+                        else:
+                            xcall(client, "send_message", chat, r.get("text") or "")
+                    except FloodWaitError as e:
+                        secs = int(getattr(e, "seconds", 60) or 60)
+                        _tabchi_backoff[gid] = time.time() + secs + 5
+                        log(f"tabchi #{gid} flood, backoff {secs}s")
+                        continue
                     with _db_lock:
                         conn = get_conn()
-                        conn.execute("UPDATE tabchi_groups SET last_sent=? WHERE id=?", (now_str(), r["id"]))
+                        conn.execute("UPDATE tabchi_groups SET last_sent=? WHERE id=?", (now_str(), gid))
                         conn.commit()
                         conn.close()
                     bump_activity(r["user_id"], "tabchi")
+                    log(f"tabchi #{gid} sent")
                     time.sleep(max(1, int(r.get("delay_sec", 5) or 5)))
                 except Exception as e:
                     log("tabchi send err", repr(e)[:200])
@@ -4211,73 +4321,120 @@ def tabchi_loop():
             time.sleep(20)
 
 
+def run_profile_cycle(acc_id, uid, client, tick, force_key=None):
+    """یک چرخه پروفایل (نام/ساعت/بیو/یادآور/آرشیو). خروجی: لیست گزارش."""
+    out = []
+    do_name = force_key in (None, "name_rotate", "live_clock")
+    do_bio = force_key in (None, "bio_rotate")
+    if do_name:
+        on_nm, _e = get_toggle(uid, "name_rotate")
+        on_ck, _e2 = get_toggle(uid, "live_clock")
+        if on_nm or on_ck:
+            kw = {}
+            if on_nm:
+                cfg = _cfg_name(uid)
+                base0 = (cfg.get("base") or "").strip()
+                if not base0:
+                    me = xcall(client, "get_me")
+                    base0 = (getattr(me, "first_name", "") or "🌙").split("🕒")[0].strip()[:40] or "🌙"
+                    cfg["base"] = base0
+                    set_toggle(uid, "name_rotate", on_nm, json.dumps(cfg, ensure_ascii=False))
+                kw["first_name"] = _render_name(base0, cfg)[:64]
+            if on_ck:
+                kw["last_name"] = _render_clock(_cfg_clock(uid))[:64]
+            try:
+                xcall(client, "__call__", UpdateProfileRequest(**kw))
+                log(f"profile acc={acc_id} name/clock updated")
+                if force_key:
+                    parts = []
+                    if "first_name" in kw:
+                        parts.append(f"نام: {kw['first_name']}")
+                    if "last_name" in kw:
+                        parts.append(f"نام خانوادگی: {kw['last_name']}")
+                    out.append("✅ " + " | ".join(parts))
+                else:
+                    out.append("✅ نام/ساعت به‌روز شد")
+            except FloodWaitError as e:
+                secs = int(getattr(e, "seconds", 60) or 60)
+                out.append(f"⏳ محدودیت تلگرام ({secs} ثانیه صبر کن)")
+                log(f"profile acc={acc_id} flood {secs}s")
+                return out
+            except Exception as e:
+                out.append(f"⚠️ خطای نام: {str(e)[:100]}")
+                log(f"profile acc={acc_id} name err", repr(e)[:200])
+    if do_bio and (force_key or tick % 10 == 0):
+        on_b, _e = get_toggle(uid, "bio_rotate")
+        if on_b:
+            t = now_tehran()
+            bios = _cfg_list(uid, "bio_rotate") or BIO_ROTATE_LIST
+            raw = bios[(tick // 10) % len(bios)]
+            bio = raw.replace("{time}", t.strftime("%H:%M")).replace("{date}", t.strftime("%Y/%m/%d"))
+            try:
+                xcall(client, "__call__", UpdateProfileRequest(about=bio[:70]))
+                out.append("✅ بیو عوض شد" + (f": {bio[:50]}" if force_key else ""))
+                log(f"profile acc={acc_id} bio updated")
+            except FloodWaitError:
+                out.append("⏳ محدودیت تلگرام برای بیو")
+            except Exception as e:
+                out.append(f"⚠️ خطای بیو: {str(e)[:100]}")
+                log(f"profile acc={acc_id} bio err", repr(e)[:200])
+    if force_key in (None, "profile_schedule"):
+        on_pf, ex_pf = get_toggle(uid, "profile_schedule")
+        try:
+            pf_hour = int((ex_pf or "9").strip())
+        except Exception:
+            pf_hour = 9
+        now_t = now_tehran()
+        if on_pf and (force_key or (now_t.hour == pf_hour and now_t.minute < 2)):
+            if force_key or get_setting(f"pf_{uid}_{today_str()}", "") != "1":
+                try:
+                    xcall(client, "send_message", "me", "⏰ یادآور سلف دارک: وقت تغییر عکس پروفایل! (ریپلای عکس + <code>.پروفایل</code>)")
+                    set_setting(f"pf_{uid}_{today_str()}", "1")
+                    out.append("✅ یادآور پروفایل ارسال شد")
+                except Exception as e:
+                    out.append(f"⚠️ خطای یادآور: {str(e)[:80]}")
+    if force_key is None and tick % 180 == 0:
+        on_ar, _e = get_toggle(uid, "auto_archive")
+        if on_ar:
+            try:
+                n_arch = 0
+                dialogs = xcall(client, "get_dialogs", limit=60)
+                for d in dialogs:
+                    try:
+                        if getattr(d, "archived", False) or getattr(d, "pinned", False):
+                            continue
+                        if not getattr(d, "is_group", False):
+                            continue
+                        if getattr(d, "unread_count", 0):
+                            continue
+                        xcall(client, "edit_folder", d.entity, 1)
+                        n_arch += 1
+                    except Exception:
+                        continue
+                out.append(f"🗂 آرشیو شد: {n_arch}")
+            except Exception as e:
+                out.append(f"⚠️ خطای آرشیو: {str(e)[:80]}")
+    return out or ["ℹ️ کاری برای اجرا نبود (قابلیت‌ها خاموش‌اند؟)"]
+
+
 def bio_name_loop():
-    n = 0
+    tick = 0
+    first = True
     while True:
         try:
-            time.sleep(600)
-            n += 1
+            if not first:
+                time.sleep(60)
+            first = False
+            tick += 1
             with self_clients_lock:
                 items = list(self_clients.items())
             for acc_id, info in items:
                 try:
-                    uid = info["user_id"]
-                    client = info["client"]
-                    on_b, _e = get_toggle(uid, "bio_rotate")
-                    if on_b:
-                        t = now_tehran()
-                        bios = _cfg_list(uid, "bio_rotate") or BIO_ROTATE_LIST
-                        raw = bios[n % len(bios)]
-                        bio = raw.replace("{time}", t.strftime("%H:%M")).replace("{date}", t.strftime("%Y/%m/%d"))
-                        try:
-                            xcall(client, "__call__", UpdateProfileRequest(about=bio[:70]))
-                        except Exception:
-                            pass
-                    on_nm, _e = get_toggle(uid, "name_rotate")
-                    if on_nm and n % 6 == 0:
-                        try:
-                            cfg = _cfg_name(uid)
-                            base0 = (cfg.get("base") or "").strip()
-                            if not base0:
-                                me = xcall(client, "get_me")
-                                base0 = (getattr(me, "first_name", "") or "🌙").split("🕒")[0].strip()[:40] or "🌙"
-                                cfg["base"] = base0
-                                set_toggle(uid, "name_rotate", on_nm, json.dumps(cfg, ensure_ascii=False))
-                            new_name = _render_name(base0, cfg)
-                            xcall(client, "__call__", UpdateProfileRequest(first_name=new_name[:64]))
-                        except Exception:
-                            pass
-                    on_pf, ex_pf = get_toggle(uid, "profile_schedule")
-                    try:
-                        pf_hour = int((ex_pf or "9").strip())
-                    except Exception:
-                        pf_hour = 9
-                    if on_pf and now_tehran().hour == pf_hour and n % 6 == 1:
-                        try:
-                            xcall(client, "send_message", "me", "⏰ یادآور سلف دارک: وقت تغییر عکس پروفایل! (ریپلای عکس + <code>.پروفایل</code>)")
-                        except Exception:
-                            pass
-                    on_ar, _e = get_toggle(uid, "auto_archive")
-                    if on_ar and n % 6 == 2:
-                        try:
-                            dialogs = xcall(client, "get_dialogs", limit=60)
-                            for d in dialogs:
-                                try:
-                                    if getattr(d, "archived", False) or getattr(d, "pinned", False):
-                                        continue
-                                    if not getattr(d, "is_group", False):
-                                        continue
-                                    if getattr(d, "unread_count", 0):
-                                        continue
-                                    xcall(client, "edit_folder", d.entity, 1)
-                                except Exception:
-                                    continue
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                    run_profile_cycle(int(acc_id), info["user_id"], info["client"], tick)
+                except Exception as e:
+                    log(f"profile cycle acc={acc_id} err", repr(e)[:150])
         except Exception:
-            time.sleep(300)
+            time.sleep(60)
 
 
 def reminders_loop():
@@ -4329,7 +4486,7 @@ def scheduled_loop():
                     info = self_clients.get(int(r.get("account_id") or 0))
                 if info and on:
                     try:
-                        xcall(info["client"], "send_message", str(r["chat_id"]), r.get("text") or "")
+                        xcall(info["client"], "send_message", resolve_chat(r["chat_id"]), r.get("text") or "")
                     except Exception as e:
                         log("sched send err", repr(e)[:150])
                         continue
