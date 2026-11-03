@@ -42,7 +42,7 @@ except Exception:
 # ============================================================
 # تنظیمات اصلی (با مقادیر پیش‌فرض داخل کد؛ بدون نیاز به Env)
 # ============================================================
-BOT_VERSION = "SELF-DARK-V1.1"
+BOT_VERSION = "SELF-DARK-V1.2"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8315326974:AAGnH1KEiDKw93u-JBV23OrPOe_jQYpTwXw").strip()
 try:
     ADMIN_ID = int(os.environ.get("ADMIN_ID", "8248647747"))
@@ -2239,6 +2239,36 @@ def xcall(client, fname, *a, **k):
     return asyncio.run_coroutine_threadsafe(coro, client.loop).result(timeout=90)
 
 
+def ensure_thread_loop():
+    """هر تردی که کلاینت Telethon می‌سازد باید اول event loop اختصاصی داشته باشد.
+    رفع خطای: There is no current event loop in thread ..."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop is not None and not loop.is_closed():
+            return loop
+    except Exception:
+        pass
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    return loop
+
+
+def close_thread_loop():
+    try:
+        loop = asyncio.get_event_loop()
+        if loop is not None and not loop.is_running():
+            try:
+                loop.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        asyncio.set_event_loop(None)
+    except Exception:
+        pass
+
+
 def normalize_phone(s):
     s = fa_to_en(s).strip().replace(" ", "").replace("-", "")
     if s.startswith("00"):
@@ -2432,6 +2462,7 @@ def st_self_phone(uid, text, m):
 def self_do_send_code(uid, acc_id, phone, chat_id):
     if not TELETHON_OK:
         return
+    ensure_thread_loop()
     client = None
     try:
         client = TelegramClient(StringSession(), API_ID, API_HASH)
@@ -2467,6 +2498,7 @@ def self_do_send_code(uid, acc_id, phone, chat_id):
                 client.disconnect()
         except Exception:
             pass
+        close_thread_loop()
 
 
 @register_state("self_code")
@@ -2482,6 +2514,7 @@ def st_self_code(uid, text, m):
 
 
 def self_do_sign_in(uid, acc_id, code, chat_id):
+    ensure_thread_loop()
     client = None
     try:
         acc = get_self_account_by_id(acc_id)
@@ -2518,6 +2551,7 @@ def self_do_sign_in(uid, acc_id, code, chat_id):
                 client.disconnect()
         except Exception:
             pass
+        close_thread_loop()
 
 
 @register_state("self_2fa")
@@ -2529,6 +2563,7 @@ def st_self_2fa(uid, text, m):
 
 
 def self_do_2fa(uid, acc_id, pw, chat_id):
+    ensure_thread_loop()
     client = None
     try:
         acc = get_self_account_by_id(acc_id)
@@ -2554,6 +2589,7 @@ def self_do_2fa(uid, acc_id, pw, chat_id):
                 client.disconnect()
         except Exception:
             pass
+        close_thread_loop()
 
 
 def self_finalize_login(uid, acc_id, client, chat_id):
@@ -2690,6 +2726,7 @@ def start_self_client(acc_id):
 def run_self_client(acc_id):
     if not TELETHON_OK:
         return
+    ensure_thread_loop()
     acc = get_self_account_by_id(acc_id)
     if not acc:
         return
@@ -2829,6 +2866,7 @@ def run_self_client(acc_id):
                 client.disconnect()
         except Exception:
             pass
+        close_thread_loop()
 
 
 SELF_HELP = """🌙 <b>راهنمای سلف دارک</b> ⚡
