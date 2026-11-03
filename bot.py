@@ -42,7 +42,7 @@ except Exception:
 # ============================================================
 # تنظیمات اصلی (با مقادیر پیش‌فرض داخل کد؛ بدون نیاز به Env)
 # ============================================================
-BOT_VERSION = "SELF-DARK-V1"
+BOT_VERSION = "SELF-DARK-V1.1"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8315326974:AAGnH1KEiDKw93u-JBV23OrPOe_jQYpTwXw").strip()
 try:
     ADMIN_ID = int(os.environ.get("ADMIN_ID", "8248647747"))
@@ -211,7 +211,7 @@ def init_db():
             session_string TEXT DEFAULT '', is_on INTEGER DEFAULT 0,
             activated_at TEXT DEFAULT '', last_billing TEXT DEFAULT '',
             login_step TEXT DEFAULT 'none', phone_code_hash TEXT DEFAULT '',
-            temp_phone TEXT DEFAULT '', label TEXT DEFAULT '')""")
+            temp_phone TEXT DEFAULT '', label TEXT DEFAULT '', created TEXT DEFAULT '')""")
         c.execute("""CREATE TABLE IF NOT EXISTS self_toggles(
             user_id INTEGER, feature_key TEXT, is_on INTEGER DEFAULT 0, extra TEXT DEFAULT '',
             PRIMARY KEY(user_id, feature_key))""")
@@ -246,6 +246,15 @@ def init_db():
                         c.execute(ddl)
                     except Exception:
                         pass
+        except Exception:
+            pass
+        try:
+            scols = [r[1] for r in c.execute("PRAGMA table_info(self_accounts)").fetchall()]
+            if "created" not in scols:
+                try:
+                    c.execute("ALTER TABLE self_accounts ADD COLUMN created TEXT DEFAULT ''")
+                except Exception:
+                    pass
         except Exception:
             pass
         defaults = {
@@ -1385,7 +1394,11 @@ def all_callbacks(call):
         try:
             bot.answer_callback_query(call.id, "⚠️ خطا!")
         except Exception:
-            pass
+            try:
+                if getattr(call, "message", None):
+                    bot.send_message(call.message.chat.id, "⚠️ خطای موقت! دوباره تلاش کنید.")
+            except Exception:
+                pass
 
 
 @register_state("tb_edit")
@@ -2335,11 +2348,29 @@ def self_account_label(a):
 
 # ---------- شروع لاگین ----------
 def self_begin_login(uid, call):
+    try:
+        _self_begin_login_inner(uid, call)
+    except Exception:
+        log("self_begin FATAL", traceback.format_exc()[-800:])
+        try:
+            cid = call.message.chat.id if getattr(call, "message", None) else uid
+            bot.send_message(cid, "⚠️ خطای موقت در ساخت سلف! دوباره تلاش کن. (کد: SELFNEW)")
+        except Exception:
+            pass
+        try:
+            bot.send_message(ADMIN_ID, f"⚠️ خطای ساخت سلف برای <code>{uid}</code>:\n{esc(traceback.format_exc()[-800:])}",
+                             parse_mode="HTML")
+        except Exception:
+            pass
+
+
+def _self_begin_login_inner(uid, call):
     chat_id = call.message.chat.id
     try:
-        bot.answer_callback_query(call.id)
+        bot.answer_callback_query(call.id, "⏳ در حال آماده‌سازی سلف...")
     except Exception:
         pass
+    log(f"s:new uid={uid} telethon={TELETHON_OK}")
     if not TELETHON_OK:
         bot.send_message(chat_id, "⚠️ موتور سلف روی سرور فعال نیست! به ادمین خبر بده.")
         return
