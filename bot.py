@@ -21,7 +21,10 @@ from telebot import types
 from flask import Flask, request
 
 try:
-    from telethon.sync import TelegramClient, events
+    # NOTE: عمداً از telethon خالص (async) استفاده می‌شود، نه telethon.sync؛
+    # چون ایمپورت telethon.sync همه متدها را در کل پروسه سنکرون می‌کند و با
+    # معماری چندتردی ما (run_coroutine_threadsafe) ناسازگار است.
+    from telethon import TelegramClient, events
     from telethon.sessions import StringSession
     from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
     from telethon.tl.functions.account import UpdateProfileRequest
@@ -48,7 +51,7 @@ except Exception:
 # ============================================================
 # تنظیمات اصلی (با مقادیر پیش‌فرض داخل کد؛ بدون نیاز به Env)
 # ============================================================
-BOT_VERSION = "SELF-DARK-V1.3"
+BOT_VERSION = "SELF-DARK-V1.4"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8315326974:AAGnH1KEiDKw93u-JBV23OrPOe_jQYpTwXw").strip()
 try:
     ADMIN_ID = int(os.environ.get("ADMIN_ID", "8248647747"))
@@ -2874,7 +2877,7 @@ def start_self_client(acc_id):
 def run_self_client(acc_id):
     if not TELETHON_OK:
         return
-    ensure_thread_loop()
+    loop = ensure_thread_loop()
     acc = get_self_account_by_id(acc_id)
     if not acc:
         return
@@ -2882,8 +2885,8 @@ def run_self_client(acc_id):
     client = None
     try:
         client = TelegramClient(StringSession(acc["session_string"]), API_ID, API_HASH)
-        client.connect()
-        if not client.is_user_authorized():
+        loop.run_until_complete(client.connect())
+        if not loop.run_until_complete(client.is_user_authorized()):
             log("self", acc_id, "session invalid -> off")
             update_self_account(acc_id, is_on=0)
             try:
@@ -2929,7 +2932,7 @@ def run_self_client(acc_id):
                 on_p, _e = get_toggle(uid, "auto_pin")
                 if on_p and txt and "#مهم" in txt:
                     try:
-                        await event.pin()
+                        await client.pin_message(event.chat_id, event.message)
                     except Exception:
                         pass
                 on_st, _e = get_toggle(uid, "sticker_suggest")
@@ -3003,7 +3006,7 @@ def run_self_client(acc_id):
                 log("self-out err", traceback.format_exc()[-300:])
 
         log("self client started", acc_id, "uid", uid)
-        client.run_until_disconnected()
+        loop.run_until_complete(client.run_until_disconnected())
     except Exception as e:
         log("self client", acc_id, "died:", repr(e)[:250])
     finally:
@@ -3011,7 +3014,7 @@ def run_self_client(acc_id):
             self_clients.pop(int(acc_id), None)
         try:
             if client:
-                client.disconnect()
+                loop.run_until_complete(client.disconnect())
         except Exception:
             pass
         close_thread_loop()
@@ -3586,7 +3589,7 @@ def bio_name_loop():
                                         continue
                                     if getattr(d, "unread_count", 0):
                                         continue
-                                    xcall(client, "edit_folder", d, 1)
+                                    xcall(client, "edit_folder", d.entity, 1)
                                 except Exception:
                                     continue
                         except Exception:
