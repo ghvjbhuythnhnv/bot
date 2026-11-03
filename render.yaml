@@ -1,15 +1,16 @@
 services:
   - type: web
-    name: freedogs-dark-bot
+    name: selfdark-bot
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      - key: BOT_TOKEN
-        sync: false
       - key: ADMIN_ID
-        value: "8248647747"
+        value: 8248647747
       - key: BOT_USERNAME
-        value: FREEDOGSDARKBOT
+        value: "@selfbuilddarkbot"
+      - key: API_ID
+        value: 32063619
